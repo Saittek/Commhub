@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "commhub",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2026-07-04",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "observability": {
+    "enabled": true
+  },
+  "upload_source_maps": true,
+  "assets": {
+    "directory": "./dist/client",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "commhub-db",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VOICE_ROOM",
+        "class_name": "VoiceRoom"
+      },
+      {
+        "name": "TEXT_ROOM",
+        "class_name": "TextRoom"
+      }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "ATTACHMENTS",
+      "bucket_name": "commhub-attachments"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["VoiceRoom"]
+    },
+    {
+      "tag": "v2",
+      "new_classes": ["TextRoom"]
+    }
+  ]
+}

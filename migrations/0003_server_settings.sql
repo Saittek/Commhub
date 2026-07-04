@@ -1,0 +1,7 @@
+ALTER TABLE servers ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE servers ADD COLUMN region TEXT NOT NULL DEFAULT 'us-east';
+ALTER TABLE servers ADD COLUMN invites_paused INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN verification_level INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN default_notifications TEXT NOT NULL DEFAULT 'all';
+ALTER TABLE servers ADD COLUMN explicit_content_filter INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN afk_timeout_minutes INTEGER NOT NULL DEFAULT 5;
