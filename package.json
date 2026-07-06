@@ -22,7 +22,7 @@
     "react-router-dom": "^7.9.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.15.3",
+    "@cloudflare/vite-plugin": "1.15.3",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
