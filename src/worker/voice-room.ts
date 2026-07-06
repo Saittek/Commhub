@@ -11,6 +11,8 @@ export interface VoicePeer {
   speaking: boolean;
   cameraEnabled: boolean;
   screenSharing: boolean;
+  callsSessionId?: string;
+  publishedTracks?: string[];
 }
 
 interface PeerAttachment {
@@ -26,6 +28,8 @@ interface PeerAttachment {
   screenSharing: boolean;
   lastActivityAt: number;
   serverId: string;
+  callsSessionId?: string;
+  publishedTracks?: string[];
 }
 
 interface RTCIceCandidateInit {
@@ -64,7 +68,8 @@ type InboundMessage =
       cameraEnabled?: boolean;
       screenSharing?: boolean;
     }
-  | { type: "play-sound"; soundId: string; soundUrl: string; soundName: string };
+  | { type: "play-sound"; soundId: string; soundUrl: string; soundName: string }
+  | { type: "announce-tracks"; sessionId: string; tracks: string[] };
 
 export class VoiceRoom extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -95,6 +100,10 @@ export class VoiceRoom extends DurableObject<Env> {
     const username = request.headers.get("X-Username");
     const userLimitHeader = request.headers.get("X-Voice-User-Limit");
     const serverId = request.headers.get("X-Server-Id") ?? "";
+    const callsSessionId =
+      request.headers.get("X-Calls-Session-Id") ??
+      url.searchParams.get("callsSessionId") ??
+      undefined;
 
     if (!userId || !displayName || !username) {
       return new Response("Missing voice session headers.", { status: 400 });
@@ -134,6 +143,8 @@ export class VoiceRoom extends DurableObject<Env> {
       screenSharing: false,
       lastActivityAt: Date.now(),
       serverId,
+      callsSessionId: callsSessionId || undefined,
+      publishedTracks: [],
     };
 
     this.ctx.acceptWebSocket(server);
@@ -196,6 +207,22 @@ export class VoiceRoom extends DurableObject<Env> {
           displayName: attachment.displayName,
         }),
         ws,
+      );
+      return;
+    }
+
+    if (payload.type === "announce-tracks") {
+      attachment.callsSessionId = payload.sessionId;
+      attachment.publishedTracks = payload.tracks;
+      attachment.lastActivityAt = Date.now();
+      ws.serializeAttachment(attachment);
+      this.broadcast(
+        JSON.stringify({
+          type: "peer-tracks",
+          userId: attachment.userId,
+          sessionId: payload.sessionId,
+          tracks: payload.tracks,
+        }),
       );
     }
   }
@@ -423,6 +450,8 @@ export class VoiceRoom extends DurableObject<Env> {
       speaking: attachment.speaking,
       cameraEnabled: attachment.cameraEnabled,
       screenSharing: attachment.screenSharing,
+      callsSessionId: attachment.callsSessionId,
+      publishedTracks: attachment.publishedTracks,
     };
   }
 

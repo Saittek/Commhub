@@ -24,6 +24,8 @@ export interface VoicePeer {
   speaking: boolean;
   cameraEnabled: boolean;
   screenSharing: boolean;
+  callsSessionId?: string;
+  publishedTracks?: string[];
 }
 
 export interface LocalVoiceMedia {
@@ -61,7 +63,13 @@ interface RTCSignalData {
   candidate?: RTCIceCandidateInit;
 }
 
-import { buildIceServers } from "./voice-ice";
+import { buildIceServers, buildIceServersForCalls } from "./voice-ice";
+import {
+  fetchCallsConfig,
+  parseTrackName,
+  trackNameFor,
+  VoiceCallsSfu,
+} from "./voice-calls-sfu";
 
 function isScreenShareTrack(track: MediaStreamTrack): boolean {
   const settings = track.getSettings();
@@ -80,6 +88,8 @@ function defaultPeer(peer: Partial<VoicePeer> & Pick<VoicePeer, "userId" | "disp
     speaking: peer.speaking ?? false,
     cameraEnabled: peer.cameraEnabled ?? false,
     screenSharing: peer.screenSharing ?? false,
+    callsSessionId: peer.callsSessionId,
+    publishedTracks: peer.publishedTracks,
   };
 }
 
@@ -143,6 +153,9 @@ export class VoiceClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
   private onRemoteSound?: (soundUrl: string, soundName: string, displayName: string) => void;
+  private sfu: VoiceCallsSfu | null = null;
+  private useSfu = false;
+  private pulledTrackKeys = new Set<string>();
 
   constructor(options: VoiceClientOptions) {
     this.serverId = options.serverId;
@@ -224,12 +237,31 @@ export class VoiceClient {
       this.setupSpeakingDetection();
       this.emitLocalMedia();
 
+      const callsConfig = await fetchCallsConfig(this.serverId, this.channelId);
+      this.useSfu = callsConfig.enabled;
+      let callsSessionId = "";
+
+      if (this.useSfu) {
+        this.sfu = new VoiceCallsSfu(this.serverId, this.channelId);
+        callsSessionId = await this.sfu.start(buildIceServersForCalls(callsConfig.iceServers));
+        const audioTrack = this.localStream.getAudioTracks()[0];
+        if (audioTrack) {
+          await this.sfu.publishTrack(trackNameFor("audio", this.localUserId), audioTrack);
+        }
+      }
+
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/api/servers/${this.serverId}/channels/${this.channelId}/voice`;
+      let wsUrl = `${protocol}//${window.location.host}/api/servers/${this.serverId}/channels/${this.channelId}/voice`;
+      if (callsSessionId) {
+        wsUrl += `?callsSessionId=${encodeURIComponent(callsSessionId)}`;
+      }
       this.ws = new WebSocket(wsUrl);
 
       this.ws.onopen = () => {
         this.reconnectAttempts = 0;
+        if (this.useSfu && this.sfu?.activeSessionId) {
+          this.announceTracks();
+        }
         this.onConnectionState("connected");
       };
 
@@ -467,10 +499,14 @@ export class VoiceClient {
     const newTrack = this.localStream.getAudioTracks()[0];
 
     if (newTrack) {
-      for (const pc of this.peerConnections.values()) {
-        const sender = pc.getSenders().find((item) => item.track?.kind === "audio");
-        if (sender) {
-          await sender.replaceTrack(newTrack);
+      if (this.useSfu && this.sfu) {
+        await this.sfu.replacePublishedAudio(newTrack);
+      } else {
+        for (const pc of this.peerConnections.values()) {
+          const sender = pc.getSenders().find((item) => item.track?.kind === "audio");
+          if (sender) {
+            await sender.replaceTrack(newTrack);
+          }
         }
       }
     }
@@ -507,6 +543,8 @@ export class VoiceClient {
       soundUrl?: string;
       soundName?: string;
       displayName?: string;
+      sessionId?: string;
+      tracks?: string[];
     };
 
     try {
@@ -520,7 +558,9 @@ export class VoiceClient {
         if (message.peers) {
           for (const peer of message.peers) {
             this.peers.set(peer.userId, defaultPeer(peer));
-            if (this.shouldInitiateConnection(peer.userId)) {
+            if (this.useSfu) {
+              void this.syncPeerTracks(peer);
+            } else if (this.shouldInitiateConnection(peer.userId)) {
               void this.createOfferForPeer(peer.userId);
             }
           }
@@ -531,7 +571,9 @@ export class VoiceClient {
         if (message.peer) {
           this.peers.set(message.peer.userId, defaultPeer(message.peer));
           this.emitPeers();
-          if (this.shouldInitiateConnection(message.peer.userId)) {
+          if (this.useSfu) {
+            void this.syncPeerTracks(message.peer);
+          } else if (this.shouldInitiateConnection(message.peer.userId)) {
             void this.createOfferForPeer(message.peer.userId);
           }
         }
@@ -557,8 +599,19 @@ export class VoiceClient {
         }
         break;
       case "signal":
-        if (message.fromUserId && message.data) {
+        if (!this.useSfu && message.fromUserId && message.data) {
           void this.handleSignal(message.fromUserId, message.data);
+        }
+        break;
+      case "peer-tracks":
+        if (message.userId && message.sessionId && message.tracks) {
+          const peer = this.peers.get(message.userId);
+          if (peer) {
+            peer.callsSessionId = message.sessionId;
+            peer.publishedTracks = message.tracks;
+            this.emitPeers();
+            void this.syncPeerTracks(peer);
+          }
         }
         break;
       case "moved":
@@ -721,6 +774,20 @@ export class VoiceClient {
   }
 
   private async publishStreamTracks(stream: MediaStream): Promise<void> {
+    if (this.useSfu && this.sfu) {
+      for (const track of stream.getTracks()) {
+        if (track.kind === "video") {
+          const trackName = trackNameFor(
+            isScreenShareTrack(track) ? "screen" : "camera",
+            this.localUserId,
+          );
+          await this.sfu.publishTrack(trackName, track);
+        }
+      }
+      this.announceTracks();
+      return;
+    }
+
     for (const track of stream.getTracks()) {
       for (const pc of this.peerConnections.values()) {
         const alreadyPublished = pc
@@ -736,6 +803,20 @@ export class VoiceClient {
   }
 
   private async unpublishStreamTracks(stream: MediaStream): Promise<void> {
+    if (this.useSfu && this.sfu) {
+      for (const track of stream.getTracks()) {
+        if (track.kind === "video") {
+          const trackName = trackNameFor(
+            isScreenShareTrack(track) ? "screen" : "camera",
+            this.localUserId,
+          );
+          await this.sfu.unpublishTrack(trackName);
+        }
+      }
+      this.announceTracks();
+      return;
+    }
+
     for (const track of stream.getTracks()) {
       for (const pc of this.peerConnections.values()) {
         const sender = pc.getSenders().find((item) => item.track?.id === track.id);
@@ -760,6 +841,84 @@ export class VoiceClient {
       } catch {
         // Ignore renegotiation failures for disconnected peers.
       }
+    }
+  }
+
+  private announceTracks() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.sfu?.activeSessionId) {
+      return;
+    }
+
+    const tracks = this.sfu.getPublishedTrackNames();
+    this.ws.send(
+      JSON.stringify({
+        type: "announce-tracks",
+        sessionId: this.sfu.activeSessionId,
+        tracks,
+      }),
+    );
+
+    const localPeer = this.peers.get(this.localUserId);
+    if (localPeer) {
+      localPeer.callsSessionId = this.sfu.activeSessionId;
+      localPeer.publishedTracks = tracks;
+    }
+  }
+
+  private async syncPeerTracks(peer: VoicePeer) {
+    if (!this.useSfu || !this.sfu || peer.userId === this.localUserId) {
+      return;
+    }
+
+    const sessionId = peer.callsSessionId;
+    const trackNames = peer.publishedTracks ?? [];
+    if (!sessionId || trackNames.length === 0) {
+      return;
+    }
+
+    const refs = trackNames
+      .map((trackName) => ({ trackName, sessionId }))
+      .filter((ref) => {
+        const key = `${ref.sessionId}:${ref.trackName}`;
+        return !this.pulledTrackKeys.has(key);
+      });
+
+    if (refs.length === 0) {
+      return;
+    }
+
+    try {
+      const tracks = await this.sfu.pullTracks(refs);
+      for (let index = 0; index < refs.length; index += 1) {
+        const ref = refs[index];
+        const track = tracks[index];
+        if (!track) {
+          continue;
+        }
+
+        const key = `${ref.sessionId}:${ref.trackName}`;
+        this.pulledTrackKeys.add(key);
+        const parsed = parseTrackName(ref.trackName);
+        if (!parsed || parsed.userId !== peer.userId) {
+          continue;
+        }
+
+        if (parsed.kind === "audio") {
+          let audio = this.remoteAudio.get(peer.userId);
+          if (!audio) {
+            audio = new Audio();
+            audio.autoplay = true;
+            this.remoteAudio.set(peer.userId, audio);
+          }
+          audio.srcObject = new MediaStream([track]);
+          void applyOutputDevice(audio, this.outputDeviceId);
+          this.applyRemoteAudioState();
+        } else {
+          this.attachRemoteVideoTrack(peer.userId, track);
+        }
+      }
+    } catch {
+      // Ignore transient SFU pull failures; peers may retry on track updates.
     }
   }
 
@@ -831,6 +990,13 @@ export class VoiceClient {
       this.remoteAudio.delete(userId);
     }
     this.remoteMedia.delete(userId);
+    for (const key of this.pulledTrackKeys) {
+      if (key.endsWith(`:${trackNameFor("audio", userId)}`) ||
+        key.endsWith(`:${trackNameFor("camera", userId)}`) ||
+        key.endsWith(`:${trackNameFor("screen", userId)}`)) {
+        this.pulledTrackKeys.delete(key);
+      }
+    }
     this.emitPeers();
     this.emitRemoteMedia();
   }
@@ -1014,6 +1180,11 @@ export class VoiceClient {
       pc.close();
     }
     this.peerConnections.clear();
+
+    this.sfu?.destroy();
+    this.sfu = null;
+    this.useSfu = false;
+    this.pulledTrackKeys.clear();
 
     for (const audio of this.remoteAudio.values()) {
       audio.srcObject = null;

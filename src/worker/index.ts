@@ -107,6 +107,7 @@ import { registerBotRoutes } from "./bot-routes";
 import { registerOAuthRoutes } from "./oauth-routes";
 import { registerPlatformRoutes } from "./platform-routes";
 import { registerForumRoutes } from "./forum-routes";
+import { registerCallsRoutes } from "./calls-routes";
 import { isMemberTimedOut } from "./lib/discord-features";
 import { ensurePrivacySettings } from "./lib/privacy";
 import { buildUserProfile } from "./lib/user-profile";
@@ -1520,6 +1521,11 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
     headers.set("X-Can-Speak", canSpeak ? "1" : "0");
     headers.set("X-Server-Id", server.id);
 
+    const callsSessionId = new URL(c.req.url).searchParams.get("callsSessionId");
+    if (callsSessionId?.trim()) {
+      headers.set("X-Calls-Session-Id", callsSessionId.trim());
+    }
+
     const roomId = c.env.VOICE_ROOM.idFromName(channelId);
     const stub = c.env.VOICE_ROOM.get(roomId);
     const upgradeRequest = new Request(c.req.raw, { headers });
@@ -2022,5 +2028,6 @@ registerBotRoutes(app);
 registerOAuthRoutes(app);
 registerPlatformRoutes(app);
 registerForumRoutes(app);
+registerCallsRoutes(app);
 
 export default app;

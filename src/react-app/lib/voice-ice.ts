@@ -24,3 +24,11 @@ export function buildIceServers(): RTCIceServer[] {
   servers.push(entry);
   return servers;
 }
+
+export function buildIceServersForCalls(configServers?: RTCIceServer[]): RTCIceServer[] {
+  if (configServers?.length) {
+    return configServers;
+  }
+
+  return [{ urls: "stun:stun.cloudflare.com:3478" }];
+}
