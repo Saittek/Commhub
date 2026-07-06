@@ -61,7 +61,7 @@ export function validateRoleName(name: string): string | null {
 
 export function validateRoleColor(color: string): string | null {
   if (!COLOR_PATTERN.test(color)) {
-    return "Role color must be a valid hex color (e.g. #5865f2).";
+    return "Role color must be a valid hex color (e.g. #14b8a6).";
   }
   return null;
 }

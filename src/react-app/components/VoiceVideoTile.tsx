@@ -4,9 +4,17 @@ interface VoiceVideoTileProps {
   stream: MediaStream;
   label: string;
   mirrored?: boolean;
+  variant?: "camera" | "screen";
+  featured?: boolean;
 }
 
-export default function VoiceVideoTile({ stream, label, mirrored = false }: VoiceVideoTileProps) {
+export default function VoiceVideoTile({
+  stream,
+  label,
+  mirrored = false,
+  variant = "camera",
+  featured = false,
+}: VoiceVideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
@@ -26,7 +34,9 @@ export default function VoiceVideoTile({ stream, label, mirrored = false }: Voic
   }, [stream]);
 
   return (
-    <div className="voice-video-tile">
+    <div
+      className={`voice-video-tile voice-video-tile--${variant}${featured ? " voice-video-tile--featured" : ""}`}
+    >
       <video
         ref={videoRef}
         className={`voice-video-element${mirrored ? " mirrored" : ""}`}

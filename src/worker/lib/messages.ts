@@ -12,12 +12,51 @@ export interface MessageRow {
   created_at: string;
   edited_at: string | null;
   deleted_at: string | null;
+  thread_archived?: number;
+  thread_locked?: number;
+}
+
+let messageThreadColumnsReady: Promise<void> | null = null;
+
+export async function ensureMessageThreadColumns(db: D1Database): Promise<void> {
+  if (!messageThreadColumnsReady) {
+    messageThreadColumnsReady = (async () => {
+      const info = await db.prepare("PRAGMA table_info(messages)").all<{ name: string }>();
+      const names = new Set((info.results ?? []).map((row) => row.name));
+      if (!names.has("thread_archived")) {
+        await db
+          .prepare("ALTER TABLE messages ADD COLUMN thread_archived INTEGER NOT NULL DEFAULT 0")
+          .run();
+      }
+      if (!names.has("thread_locked")) {
+        await db
+          .prepare("ALTER TABLE messages ADD COLUMN thread_locked INTEGER NOT NULL DEFAULT 0")
+          .run();
+      }
+    })().catch((error) => {
+      messageThreadColumnsReady = null;
+      throw error;
+    });
+  }
+
+  await messageThreadColumnsReady;
+}
+
+export interface EmbedRow {
+  id: string;
+  message_id: string;
+  url: string;
+  title: string | null;
+  description: string | null;
+  image_url: string | null;
+  site_name: string | null;
 }
 
 export interface AuthorRow {
   id: string;
   username: string;
   display_name: string;
+  avatar_url: string | null;
 }
 
 export interface ReactionRow {
@@ -50,6 +89,7 @@ export interface MessageDto {
     id: string;
     username: string;
     displayName: string;
+    avatarUrl: string | null;
   };
   content: string;
   threadRootId: string | null;
@@ -76,6 +116,15 @@ export interface MessageDto {
     me: boolean;
     userIds: string[];
   }>;
+  embeds: Array<{
+    url: string;
+    title: string | null;
+    description: string | null;
+    imageUrl: string | null;
+    siteName: string | null;
+  }>;
+  threadArchived: boolean;
+  threadLocked: boolean;
 }
 
 export function validateMessageContent(content: string): string | null {
@@ -112,7 +161,7 @@ export async function getMessageAuthors(
   const placeholders = authorIds.map(() => "?").join(", ");
   const result = await db
     .prepare(
-      `SELECT id, username, display_name FROM users WHERE id IN (${placeholders})`,
+      `SELECT id, username, display_name, avatar_url FROM users WHERE id IN (${placeholders})`,
     )
     .bind(...authorIds)
     .all<AuthorRow>();
@@ -135,6 +184,7 @@ export async function listChannelMessages(
     serverId: string;
   },
 ): Promise<MessageDto[]> {
+  await ensureMessageThreadColumns(db);
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
   const threadRootId = options.threadRootId ?? null;
 
@@ -152,7 +202,8 @@ export async function listChannelMessages(
 
     const result = await db
       .prepare(
-        `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at
+        `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at,
+                thread_archived, thread_locked
          FROM messages
          WHERE channel_id = ?
            AND ((? IS NULL AND thread_root_id IS NULL) OR thread_root_id = ?)
@@ -166,7 +217,8 @@ export async function listChannelMessages(
   } else {
     const result = await db
       .prepare(
-        `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at
+        `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at,
+                thread_archived, thread_locked
          FROM messages
          WHERE channel_id = ?
            AND ((? IS NULL AND thread_root_id IS NULL) OR thread_root_id = ?)
@@ -188,9 +240,11 @@ export async function getMessageById(
   viewerUserId: string,
   serverId: string,
 ): Promise<MessageDto | null> {
+  await ensureMessageThreadColumns(db);
   const row = await db
     .prepare(
-      `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at
+      `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at,
+              thread_archived, thread_locked
        FROM messages WHERE id = ? AND channel_id = ? LIMIT 1`,
     )
     .bind(messageId, channelId)
@@ -262,6 +316,19 @@ async function hydrateMessages(
     .bind(...messageIds)
     .all<AttachmentRow>();
 
+  let embedsResult: { results?: EmbedRow[] } = { results: [] };
+  try {
+    embedsResult = await db
+      .prepare(
+        `SELECT id, message_id, url, title, description, image_url, site_name
+         FROM message_embeds WHERE message_id IN (${placeholders})`,
+      )
+      .bind(...messageIds)
+      .all<EmbedRow>();
+  } catch {
+    // message_embeds table may not exist before migration.
+  }
+
   const pinnedResult = await db
     .prepare(
       `SELECT message_id FROM pinned_messages WHERE channel_id = ? AND message_id IN (${placeholders})`,
@@ -288,6 +355,13 @@ async function hydrateMessages(
     attachmentsByMessage.set(attachment.message_id, list);
   }
 
+  const embedsByMessage = new Map<string, EmbedRow[]>();
+  for (const embed of embedsResult.results ?? []) {
+    const list = embedsByMessage.get(embed.message_id) ?? [];
+    list.push(embed);
+    embedsByMessage.set(embed.message_id, list);
+  }
+
   return rows.map((row) => {
     const author = authors.get(row.author_id);
     const reactionMap = reactionsByMessage.get(row.id) ?? new Map();
@@ -300,6 +374,7 @@ async function hydrateMessages(
         id: row.author_id,
         username: author?.username ?? "unknown",
         displayName: author?.display_name ?? "Unknown",
+        avatarUrl: author?.avatar_url ? `/api/auth/avatars/${row.author_id}` : null,
       },
       content: row.deleted_at ? "" : row.content,
       threadRootId: row.thread_root_id,
@@ -322,6 +397,15 @@ async function hydrateMessages(
         me: data.userIds.includes(viewerUserId),
         userIds: data.userIds,
       })),
+      embeds: (embedsByMessage.get(row.id) ?? []).map((embed) => ({
+        url: embed.url,
+        title: embed.title,
+        description: embed.description,
+        imageUrl: embed.image_url,
+        siteName: embed.site_name,
+      })),
+      threadArchived: (row.thread_archived ?? 0) === 1,
+      threadLocked: (row.thread_locked ?? 0) === 1,
     };
   });
 }
@@ -397,15 +481,38 @@ export async function getLastUserMessageAt(
   return row?.created_at ?? null;
 }
 
+export async function listThreadCounts(
+  db: D1Database,
+  channelId: string,
+): Promise<Record<string, number>> {
+  const rows = await db
+    .prepare(
+      `SELECT thread_root_id, COUNT(*) as count
+       FROM messages
+       WHERE channel_id = ? AND thread_root_id IS NOT NULL AND deleted_at IS NULL
+       GROUP BY thread_root_id`,
+    )
+    .bind(channelId)
+    .all<{ thread_root_id: string; count: number }>();
+
+  const counts: Record<string, number> = {};
+  for (const row of rows.results ?? []) {
+    counts[row.thread_root_id] = row.count;
+  }
+  return counts;
+}
+
 export async function listPinnedMessages(
   db: D1Database,
   channelId: string,
   viewerUserId: string,
   serverId: string,
 ): Promise<MessageDto[]> {
+  await ensureMessageThreadColumns(db);
   const result = await db
     .prepare(
-      `SELECT m.id, m.channel_id, m.server_id, m.author_id, m.content, m.thread_root_id, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at
+      `SELECT m.id, m.channel_id, m.server_id, m.author_id, m.content, m.thread_root_id, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at,
+              m.thread_archived, m.thread_locked
        FROM pinned_messages pm
        INNER JOIN messages m ON m.id = pm.message_id
        WHERE pm.channel_id = ?

@@ -1,10 +1,12 @@
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import ChannelList from "./ChannelList";
 import ServerDial from "./ServerDial";
 import SidebarUserPanel from "./SidebarUserPanel";
 import { CommhubIcon } from "./ServerIcons";
+import { FriendsIcon } from "./UiIcons";
 import type { JoinedVoiceChannel } from "../context/VoiceContext";
-import type { Channel, Server, User } from "../lib/api";
+import { getMyPermissions, type Channel, type Server, type User } from "../lib/api";
 
 interface ServerSidebarProps {
   servers: Server[];
@@ -25,10 +27,18 @@ interface ServerSidebarProps {
   onOpenServerSettings: () => void;
   onSelectServer: (serverId: string) => void;
   onServerCreated: (server: Server) => void;
+  onServerJoined: (server: Server) => void;
   onSelectChannel: (channelId: string) => void;
   onChannelCreated: (channel: Channel) => void;
   onChannelUpdated: (channel: Channel) => void;
   onChannelDeleted: (channelId: string) => void;
+  unreadCounts?: Record<string, number>;
+  showFriends?: boolean;
+  onToggleFriends?: () => void;
+  onLogout?: () => void;
+  voiceError?: string | null;
+  onClearVoiceError?: () => void;
+  onOpenDm?: () => void;
 }
 
 export default function ServerSidebar({
@@ -50,14 +60,41 @@ export default function ServerSidebar({
   onOpenServerSettings,
   onSelectServer,
   onServerCreated,
+  onServerJoined,
   onSelectChannel,
   onChannelCreated,
   onChannelUpdated,
   onChannelDeleted,
+  unreadCounts,
+  showFriends,
+  onToggleFriends,
+  onLogout,
+  voiceError,
+  onClearVoiceError,
+  onOpenDm,
 }: ServerSidebarProps) {
   const navigate = useNavigate();
+  const [canManageChannels, setCanManageChannels] = useState(false);
   const activeServer =
     servers.find((server) => server.id === activeServerId) ?? servers[0] ?? null;
+
+  useEffect(() => {
+    if (!activeServer) {
+      setCanManageChannels(false);
+      return;
+    }
+    void getMyPermissions(activeServer.id)
+      .then((response) => {
+        setCanManageChannels(
+          Boolean(
+            response.permissions.manage_channels ||
+              response.permissions.administrator ||
+              activeServer.ownerId === user?.id,
+          ),
+        );
+      })
+      .catch(() => setCanManageChannels(false));
+  }, [activeServer, user?.id]);
 
   return (
     <div className="server-sidebar">
@@ -66,6 +103,18 @@ export default function ServerSidebar({
           <CommhubIcon size={16} />
         </span>
         <span>CommHub</span>
+        {onToggleFriends && (
+          <button
+            type="button"
+            className={`friends-toggle-btn${showFriends ? " active" : ""}`}
+            onClick={onToggleFriends}
+            title="Friends & DMs"
+            aria-label="Friends & DMs"
+            aria-pressed={showFriends}
+          >
+            <FriendsIcon className="friends-toggle-icon" />
+          </button>
+        )}
       </div>
 
       {activeServer && (
@@ -74,6 +123,7 @@ export default function ServerSidebar({
           activeServerId={activeServer.id}
           onSelectServer={onSelectServer}
           onServerCreated={onServerCreated}
+          onServerJoined={onServerJoined}
         />
       )}
 
@@ -85,6 +135,8 @@ export default function ServerSidebar({
             channels={channels}
             activeChannelId={activeChannelId}
             connectedVoiceChannelId={connectedVoiceChannelId}
+            unreadCounts={unreadCounts}
+            canManage={canManageChannels}
             onSelectChannel={onSelectChannel}
             onChannelCreated={onChannelCreated}
             onChannelUpdated={onChannelUpdated}
@@ -93,20 +145,10 @@ export default function ServerSidebar({
         </div>
       )}
 
-      <div className="server-sidebar-join">
-        <button
-          type="button"
-          className="server-action-button"
-          onClick={() => navigate("/onboarding", { state: { mode: "join" } })}
-        >
-          <span className="server-action-icon">⌕</span>
-          Join
-        </button>
-      </div>
-
       {user && (
         <SidebarUserPanel
           user={user}
+          serverId={activeServer?.id ?? null}
           voiceConnection={voiceConnection}
           serverName={activeServer?.name ?? null}
           voiceMuted={voiceMuted}
@@ -118,6 +160,11 @@ export default function ServerSidebar({
           onOpenMicSettings={onOpenMicSettings}
           onOpenHeadphoneSettings={onOpenHeadphoneSettings}
           onOpenServerSettings={onOpenServerSettings}
+          onJoinServer={() => navigate("/onboarding", { state: { mode: "join" } })}
+          onLogout={onLogout}
+          voiceError={voiceError}
+          onClearVoiceError={onClearVoiceError}
+          onOpenDm={onOpenDm}
         />
       )}
     </div>

@@ -10,6 +10,7 @@ export interface UserRow {
   email: string;
   display_name: string;
   avatar_url: string | null;
+  email_verified?: number;
 }
 
 export function mapApiUser(row: UserRow) {
@@ -17,8 +18,9 @@ export function mapApiUser(row: UserRow) {
     id: row.id,
     username: row.username,
     email: row.email,
-    displayName: row.username,
+    displayName: row.display_name,
     avatarUrl: row.avatar_url ? `/api/auth/avatars/${row.id}` : null,
+    emailVerified: (row.email_verified ?? 0) === 1,
   };
 }
 
@@ -28,7 +30,7 @@ export async function getUserRow(
 ): Promise<UserRow | null> {
   return db
     .prepare(
-      "SELECT id, username, email, display_name, avatar_url FROM users WHERE id = ? LIMIT 1",
+      "SELECT id, username, email, display_name, avatar_url, email_verified FROM users WHERE id = ? LIMIT 1",
     )
     .bind(userId)
     .first<UserRow>();
@@ -59,7 +61,8 @@ export function sessionUserFromPayload(
     id: payload.sub,
     username: row.username,
     email: row.email,
-    displayName: row.username,
+    displayName: row.display_name,
     avatarUrl: row.avatar_url ? `/api/auth/avatars/${row.id}` : null,
+    emailVerified: (row.email_verified ?? 0) === 1,
   };
 }

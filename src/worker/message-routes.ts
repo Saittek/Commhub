@@ -10,6 +10,7 @@ import {
   linkAttachmentsToMessage,
   listChannelMessages,
   listPinnedMessages,
+  listThreadCounts,
   markChannelRead,
   validateEmoji,
   validateMessageContent,
@@ -17,6 +18,12 @@ import {
   type MessageDto,
 } from "./lib/messages";
 import { memberHasPermission, getMemberPermissions } from "./lib/user-permissions";
+import { channelMemberHasPermission } from "./lib/channel-permissions";
+import { checkVerificationLevel } from "./lib/verification";
+import { rejectExplicitUpload } from "./lib/content-filter";
+import { getPrivacySettings } from "./lib/privacy";
+import { checkAutomod, isMemberTimedOut } from "./lib/discord-features";
+import { extractUrls, storeEmbedsForMessage } from "./lib/embed-fetch";
 import { TextRoom } from "./text-room";
 
 export { TextRoom };
@@ -151,6 +158,21 @@ export async function handleListMessages(
   return c.json({ messages });
 }
 
+export async function handleGetThreadCounts(
+  c: Context<{ Bindings: Env }>,
+  user: TokenPayload,
+  serverId: string,
+  channelId: string,
+) {
+  const result = await requireTextChannel(c, user, serverId, channelId);
+  if (result instanceof Response) {
+    return result;
+  }
+
+  const counts = await listThreadCounts(c.env.DB, channelId);
+  return c.json({ counts });
+}
+
 export async function handleCreateMessage(
   c: Context<{ Bindings: Env }>,
   user: TokenPayload,
@@ -162,22 +184,60 @@ export async function handleCreateMessage(
     return result;
   }
 
-  const canSend = await memberHasPermission(
+  const canSend = await channelMemberHasPermission(
     c.env.DB,
     result.server.id,
+    channelId,
     user.sub,
     result.server.owner_id,
     "send_messages",
   );
   if (!canSend) {
-    return jsonError("You do not have permission to send messages.", 403);
+    return jsonError("You do not have permission to send messages in this channel.", 403);
+  }
+
+  if (await isMemberTimedOut(c.env.DB, result.server.id, user.sub)) {
+    return jsonError("You are timed out and cannot send messages.", 403);
+  }
+
+  const verificationError = await checkVerificationLevel(
+    c.env.DB,
+    result.server,
+    user.sub,
+  );
+  if (verificationError) {
+    return jsonError(verificationError, 403);
   }
 
   const body = await c.req.json<CreateMessageInput>();
   const content = (body.content ?? "").trim();
+
+  if (content.startsWith("/")) {
+    const commandName = content.slice(1).split(/\s+/)[0]?.toLowerCase();
+    if (commandName) {
+      const command = await c.env.DB.prepare(
+        "SELECT response_text FROM slash_commands WHERE server_id = ? AND name = ? COLLATE NOCASE LIMIT 1",
+      )
+        .bind(result.server.id, commandName)
+        .first<{ response_text: string }>();
+
+      if (command) {
+        return c.json({
+          slashResponse: true,
+          content: command.response_text,
+        });
+      }
+    }
+  }
+
   const validationError = validateMessageContent(content);
   if (validationError && !(body.attachmentIds?.length ?? 0)) {
     return jsonError(validationError, 400);
+  }
+
+  const automodError = await checkAutomod(c.env.DB, result.server.id, content);
+  if (automodError) {
+    return jsonError(automodError, 400);
   }
 
   if (contentMentionsEveryone(content)) {
@@ -264,6 +324,11 @@ export async function handleCreateMessage(
 
   if (body.attachmentIds?.length) {
     await linkAttachmentsToMessage(c.env.DB, messageId, body.attachmentIds, user.sub);
+  }
+
+  const urls = extractUrls(content);
+  if (urls.length > 0) {
+    await storeEmbedsForMessage(c.env.DB, messageId, urls);
   }
 
   const message = await getMessageById(
@@ -681,6 +746,15 @@ export async function handleUploadAttachment(
     return jsonError("You do not have permission to attach files.", 403);
   }
 
+  const verificationError = await checkVerificationLevel(
+    c.env.DB,
+    result.server,
+    user.sub,
+  );
+  if (verificationError) {
+    return jsonError(verificationError, 403);
+  }
+
   if (!c.env.ATTACHMENTS) {
     return jsonError("File uploads are unavailable.", 503);
   }
@@ -699,6 +773,17 @@ export async function handleUploadAttachment(
   const contentType = file.type || "application/octet-stream";
   if (!ALLOWED_ATTACHMENT_TYPES.has(contentType)) {
     return jsonError("File type is not allowed.", 400);
+  }
+
+  const privacy = await getPrivacySettings(c.env.DB, user.sub);
+  const explicitError = rejectExplicitUpload(
+    file.name,
+    contentType,
+    result.server.explicit_content_filter === 1,
+    privacy.filterExplicitContent,
+  );
+  if (explicitError) {
+    return jsonError(explicitError, 403);
   }
 
   const attachmentId = crypto.randomUUID();

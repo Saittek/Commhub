@@ -1,11 +1,15 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { User } from "../lib/api";
+import { getMyPresence, getServerSounds, startActivity, updateMyPresence, updateMyActivity, type PresenceStatus, type ServerSound } from "../lib/api";
+import { useVoice } from "../context/VoiceContext";
 import type { JoinedVoiceChannel } from "../context/VoiceContext";
 import UserAvatar from "./UserAvatar";
-import { GearIcon } from "./UiIcons";
+import { GearIcon, JoinServerIcon, LogOutIcon, FriendsIcon } from "./UiIcons";
+import WatchTogetherModal from "./WatchTogetherModal";
 
 interface SidebarUserPanelProps {
   user: User;
+  serverId: string | null;
   voiceConnection: JoinedVoiceChannel | null;
   serverName: string | null;
   voiceMuted: boolean;
@@ -17,6 +21,11 @@ interface SidebarUserPanelProps {
   onOpenMicSettings: () => void;
   onOpenHeadphoneSettings: () => void;
   onOpenServerSettings: () => void;
+  onJoinServer?: () => void;
+  onLogout?: () => void;
+  voiceError?: string | null;
+  onClearVoiceError?: () => void;
+  onOpenDm?: () => void;
 }
 
 function SignalIcon() {
@@ -44,6 +53,17 @@ function PhoneLeaveIcon() {
       <path
         fill="currentColor"
         d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .55-.45 1-1 1H4v3h2.4c.55 0 1 .45 1 1v1.6c1.45.47 3 .72 4.6.72s3.15-.25 4.6-.72V18c0-.55.45-1 1-1H20v-3h-2.4c-.55 0-1-.45-1-1v-3.1A9.96 9.96 0 0 0 12 9m0 2c1.39 0 2.68.3 3.86.82l.14.07v2.11l-.14.07A9.86 9.86 0 0 1 12 15c-1.39 0-2.68-.3-3.86-.82l-.14-.07v-2.11l.14-.07A9.86 9.86 0 0 1 12 11"
+      />
+    </svg>
+  );
+}
+
+function VideoOnIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M17 10.5V7a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4Z"
       />
     </svg>
   );
@@ -145,6 +165,7 @@ function InVoiceIcon() {
 
 export default function SidebarUserPanel({
   user,
+  serverId,
   voiceConnection,
   serverName,
   voiceMuted,
@@ -156,14 +177,95 @@ export default function SidebarUserPanel({
   onOpenMicSettings,
   onOpenHeadphoneSettings,
   onOpenServerSettings,
+  onJoinServer,
+  onLogout,
+  voiceError,
+  onClearVoiceError,
+  onOpenDm,
 }: SidebarUserPanelProps) {
+  const voice = useVoice();
+  const inVoice = Boolean(voiceConnection);
+  const cameraOn = voice.localMedia.cameraEnabled;
+  const screenOn = voice.localMedia.screenSharing;
+  const voiceActivityActive =
+    voice.localSpeaking || voice.peers.some((peer) => peer.speaking && !peer.deafened);
+  const [status, setStatus] = useState<PresenceStatus>("online");
+  const [statusOpen, setStatusOpen] = useState(false);
+  const [activityName, setActivityName] = useState("");
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [activitiesModalOpen, setActivitiesModalOpen] = useState(false);
+  const [watchTogetherOpen, setWatchTogetherOpen] = useState(false);
+  const [soundboardOpen, setSoundboardOpen] = useState(false);
+  const [sounds, setSounds] = useState<ServerSound[]>([]);
+  const [startingActivity, setStartingActivity] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void getMyPresence().then((r) => setStatus(r.presence.status));
+  }, []);
+
+  useEffect(() => {
+    if (!serverId || !voiceConnection) {
+      setSounds([]);
+      return;
+    }
+    void getServerSounds(serverId)
+      .then((response) => setSounds(response.sounds))
+      .catch(() => setSounds([]));
+  }, [serverId, voiceConnection?.channelId]);
+
+  function playSound(sound: ServerSound) {
+    const audio = new Audio(sound.url);
+    void audio.play().catch(() => undefined);
+  }
+
+  async function handleStatusChange(next: PresenceStatus) {
+    setStatus(next);
+    setStatusOpen(false);
+    await updateMyPresence({ status: next });
+  }
+
+  const statusLabel =
+    status === "idle" ? "Idle" : status === "dnd" ? "Do Not Disturb" : status === "invisible" ? "Invisible" : "Online";
+
+  async function handleStartWatchTogether() {
+    if (!serverId || !voiceConnection) return;
+    setStartingActivity(true);
+    setActivityError(null);
+    try {
+      await startActivity(serverId, {
+        channelId: voiceConnection.channelId,
+        type: "watch",
+        name: "Watch Together",
+      });
+      setActivitiesModalOpen(false);
+      setWatchTogetherOpen(true);
+    } catch (err) {
+      setActivityError(err instanceof Error ? err.message : "Could not start activity.");
+    } finally {
+      setStartingActivity(false);
+    }
+  }
+
   const voicePath =
     voiceConnection && serverName
       ? `${voiceConnection.channelName} / ${serverName}`
       : voiceConnection?.channelName ?? null;
 
   return (
-    <div className="sidebar-user-stack">
+    <div className="sidebar-user-wrap">
+      {voiceError && (
+        <div className="sidebar-voice-error" role="alert">
+          <span>{voiceError}</span>
+          {onClearVoiceError && (
+            <button type="button" className="sidebar-voice-error-dismiss" onClick={onClearVoiceError}>
+              Dismiss
+            </button>
+          )}
+        </div>
+      )}
+      <div className="sidebar-user-card">
       {voiceConnection && (
         <>
           <div className="voice-panel-connected">
@@ -179,9 +281,13 @@ export default function SidebarUserPanel({
             <div className="voice-panel-connected-right">
               <button
                 type="button"
-                className="icon-button icon-button-sm"
-                title="Voice activity"
-                disabled
+                className={`icon-button icon-button-sm${voiceActivityActive ? " active" : ""}`}
+                title={
+                  voiceActivityActive
+                    ? "Voice activity detected"
+                    : "Waiting for voice activity"
+                }
+                aria-label="Voice activity"
               >
                 <WaveformIcon />
               </button>
@@ -197,18 +303,52 @@ export default function SidebarUserPanel({
           </div>
 
           <div className="voice-panel-quick-actions">
-            <button type="button" className="icon-button icon-button-wide" title="Camera (coming soon)" disabled>
-              <VideoOffIcon />
+            <button
+              type="button"
+              className={`icon-button icon-button-wide${cameraOn ? " active" : ""}`}
+              title={cameraOn ? "Turn off camera" : "Turn on camera"}
+              disabled={!inVoice}
+              onClick={() => void voice.toggleCamera()}
+            >
+              {cameraOn ? <VideoOnIcon /> : <VideoOffIcon />}
             </button>
-            <button type="button" className="icon-button icon-button-wide" title="Share screen (coming soon)" disabled>
+            <button
+              type="button"
+              className={`icon-button icon-button-wide${screenOn ? " active" : ""}`}
+              title={screenOn ? "Stop sharing" : "Share screen"}
+              disabled={!inVoice}
+              onClick={() => void voice.toggleScreenShare()}
+            >
               <ScreenShareIcon />
             </button>
-            <button type="button" className="icon-button icon-button-wide" title="Activities (coming soon)" disabled>
+            <button
+              type="button"
+              className="icon-button icon-button-wide"
+              title="Activities"
+              disabled={!inVoice || !serverId}
+              onClick={() => setActivitiesModalOpen(true)}
+            >
               <ActivitiesIcon />
             </button>
-            <button type="button" className="icon-button icon-button-wide" title="Soundboard (coming soon)" disabled>
+            <button
+              type="button"
+              className="icon-button icon-button-wide"
+              title="Soundboard"
+              disabled={!inVoice || !serverId || sounds.length === 0}
+              onClick={() => setSoundboardOpen(true)}
+            >
               <SoundboardIcon />
             </button>
+            {onOpenDm && (
+              <button
+                type="button"
+                className="icon-button icon-button-wide"
+                title="Direct messages"
+                onClick={onOpenDm}
+              >
+                <FriendsIcon />
+              </button>
+            )}
           </div>
         </>
       )}
@@ -222,7 +362,7 @@ export default function SidebarUserPanel({
         >
           <div className="sidebar-user-avatar-wrap">
             <UserAvatar username={user.username} avatarUrl={user.avatarUrl} size="sidebar" />
-            <span className="sidebar-user-status-dot" />
+            <span className={`sidebar-user-status-dot status-${status}`} />
           </div>
           <div className="sidebar-user-meta">
             <span className="sidebar-user-name">{user.username}</span>
@@ -232,10 +372,48 @@ export default function SidebarUserPanel({
                 In voice
               </span>
             ) : (
-              <span className="sidebar-user-status">Online</span>
+              <button
+                type="button"
+                className="sidebar-user-status status-picker-trigger"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setStatusOpen((v) => !v);
+                }}
+              >
+                {statusLabel}
+              </button>
             )}
           </div>
         </button>
+        {statusOpen && !voiceConnection && (
+          <div className="status-picker-menu">
+            {(["online", "idle", "dnd", "invisible"] as PresenceStatus[]).map((s) => (
+              <button key={s} type="button" onClick={() => void handleStatusChange(s)}>
+                {s === "online" ? "Online" : s === "idle" ? "Idle" : s === "dnd" ? "Do Not Disturb" : "Invisible"}
+              </button>
+            ))}
+            <button type="button" onClick={() => setActivityOpen((v) => !v)}>
+              Set Activity
+            </button>
+            {activityOpen && (
+              <div className="activity-picker">
+                <input
+                  value={activityName}
+                  onChange={(e) => setActivityName(e.target.value)}
+                  placeholder="Playing..."
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    void updateMyActivity({ activityType: "playing", activityName: activityName || null })
+                  }
+                >
+                  Save
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="sidebar-user-icon-row">
           <div className={`user-control-split${voiceMuted ? " active" : ""}`}>
@@ -279,15 +457,137 @@ export default function SidebarUserPanel({
           <button
             type="button"
             className="icon-button icon-button-sm"
-            title="Server settings"
-            aria-label="Server settings"
-            disabled={!serverName}
-            onClick={onOpenServerSettings}
+            title="Account menu"
+            aria-label="Account menu"
+            aria-expanded={userMenuOpen}
+            onClick={() => {
+              setUserMenuOpen((v) => !v);
+              setStatusOpen(false);
+            }}
           >
             <GearIcon />
           </button>
         </div>
+        {userMenuOpen && (
+          <div className="sidebar-user-menu" role="menu">
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setUserMenuOpen(false);
+                onOpenUserSettings();
+              }}
+            >
+              Profile settings
+            </button>
+            {serverName && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  onOpenServerSettings();
+                }}
+              >
+                Server settings
+              </button>
+            )}
+            {onJoinServer && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  onJoinServer();
+                }}
+              >
+                <JoinServerIcon className="sidebar-user-menu-icon" />
+                Join server
+              </button>
+            )}
+            {onLogout && (
+              <button
+                type="button"
+                role="menuitem"
+                className="sidebar-user-menu-danger"
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  onLogout();
+                }}
+              >
+                <LogOutIcon className="sidebar-user-menu-icon" />
+                Log out
+              </button>
+            )}
+          </div>
+        )}
       </div>
+      </div>
+
+      {watchTogetherOpen && serverId && voiceConnection && (
+        <WatchTogetherModal
+          serverId={serverId}
+          channelId={voiceConnection.channelId}
+          onClose={() => setWatchTogetherOpen(false)}
+        />
+      )}
+      {activitiesModalOpen && (
+        <div className="settings-overlay" onClick={() => setActivitiesModalOpen(false)}>
+          <div
+            className="channel-settings-modal"
+            role="dialog"
+            aria-label="Start an Activity"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="channel-settings-header">
+              <h2>Start an Activity</h2>
+              <button type="button" className="settings-close" onClick={() => setActivitiesModalOpen(false)} aria-label="Close">
+                ×
+              </button>
+            </div>
+            {activityError && <div className="settings-error">{activityError}</div>}
+            <div className="app-modal-actions">
+              <button
+                type="button"
+                className="activities-option"
+                disabled={startingActivity}
+                onClick={() => void handleStartWatchTogether()}
+              >
+                <strong>Watch Together</strong>
+                <span>Watch videos with everyone in voice</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {soundboardOpen && (
+        <div className="settings-overlay" onClick={() => setSoundboardOpen(false)}>
+          <div
+            className="channel-settings-modal"
+            role="dialog"
+            aria-label="Soundboard"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="channel-settings-header">
+              <h2>Soundboard</h2>
+              <button type="button" className="settings-close" onClick={() => setSoundboardOpen(false)} aria-label="Close">
+                ×
+              </button>
+            </div>
+            {sounds.length === 0 ? (
+              <p className="settings-muted app-modal-empty">No sounds uploaded for this server yet.</p>
+            ) : (
+              <div className="app-modal-actions voice-soundboard-buttons">
+                {sounds.map((sound) => (
+                  <button key={sound.id} type="button" className="voice-sound-btn" onClick={() => playSound(sound)}>
+                    {sound.name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

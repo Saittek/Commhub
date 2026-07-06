@@ -7,6 +7,7 @@ import UserAvatar from "./UserAvatar";
 export default function ProfileSettingsTab() {
   const { user, updateProfile, changePassword, uploadAvatar } = useAuth();
   const [email, setEmail] = useState(user?.email ?? "");
+  const [displayName, setDisplayName] = useState(user?.displayName ?? "");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -20,7 +21,8 @@ export default function ProfileSettingsTab() {
 
   useEffect(() => {
     setEmail(user?.email ?? "");
-  }, [user?.email]);
+    setDisplayName(user?.displayName ?? "");
+  }, [user?.email, user?.displayName]);
 
   if (!user) {
     return null;
@@ -37,7 +39,7 @@ export default function ProfileSettingsTab() {
     clearFeedback();
 
     try {
-      await updateProfile({ email });
+      await updateProfile({ email, displayName: displayName.trim() });
       setMessage("Profile updated.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save profile.");
@@ -115,7 +117,9 @@ export default function ProfileSettingsTab() {
     }
   }
 
-  const profileDirty = email.trim().toLowerCase() !== user.email.toLowerCase();
+  const profileDirty =
+    email.trim().toLowerCase() !== user.email.toLowerCase() ||
+    displayName.trim() !== user.displayName.trim();
   const passwordReady =
     currentPassword.length > 0 &&
     newPassword.length >= 8 &&
@@ -165,6 +169,18 @@ export default function ProfileSettingsTab() {
           <label>
             Username
             <input type="text" value={user.username} disabled readOnly />
+          </label>
+
+          <label>
+            Display name
+            <input
+              type="text"
+              value={displayName}
+              onChange={(event) => setDisplayName(event.target.value)}
+              disabled={savingProfile}
+              maxLength={32}
+              autoComplete="nickname"
+            />
           </label>
 
           <label>

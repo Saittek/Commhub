@@ -2,7 +2,7 @@ interface UserAvatarProps {
   username: string;
   avatarUrl: string | null;
   className?: string;
-  size?: "sidebar" | "profile";
+  size?: "sidebar" | "profile" | "reply";
 }
 
 function initialsFor(username: string): string {

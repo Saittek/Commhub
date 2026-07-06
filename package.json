@@ -8,8 +8,12 @@
     "cf-typegen": "wrangler types",
     "check": "tsc && vite build && wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
-    "dev": "vite",
-    "preview": "npm run build && vite preview"
+    "db:local": "wrangler d1 migrations apply commhub-db --local",
+    "db:reset-local": "node scripts/db-reset-local.mjs",
+    "dev": "wrangler d1 migrations apply commhub-db --local && vite",
+    "dev:clean": "node scripts/dev-clean.mjs",
+    "preview": "npm run build && vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "hono": "^4.11.1",
@@ -24,6 +28,7 @@
     "@vitejs/plugin-react": "^5.1.1",
     "typescript": "^5.9.3",
     "vite": "^7.0.0",
+    "vitest": "^3.2.4",
     "wrangler": "^4.107.0"
   }
 }

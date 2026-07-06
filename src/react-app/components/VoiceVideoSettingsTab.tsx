@@ -9,14 +9,17 @@ import {
   getVoiceVideoPreferences,
   INPUT_PROFILES,
   profileProcessing,
+  profileSensitivity,
   requestAudioPermission,
   requestCameraPermission,
   saveVoiceVideoPreferences,
+  speakingThreshold,
   supportsOutputSelection,
   type InputProfile,
   type VoiceProcessingSettings,
   type VoiceVideoPreferences,
 } from "../lib/voice-video-settings";
+import { VoiceAudioPipeline, webAudioPresetForSettings } from "../lib/voice-audio-pipeline";
 
 export type VoiceSettingsFocus = "microphone" | "headphones";
 
@@ -44,15 +47,22 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
   const [saving, setSaving] = useState(false);
   const [testingMic, setTestingMic] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
+  const [micWouldTransmit, setMicWouldTransmit] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const testStreamRef = useRef<MediaStream | null>(null);
+  const testPipelineRef = useRef<VoiceAudioPipeline | null>(null);
   const testContextRef = useRef<AudioContext | null>(null);
   const testIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const micSectionRef = useRef<HTMLDivElement | null>(null);
   const headphoneSectionRef = useRef<HTMLElement | null>(null);
   const outputSupported = supportsOutputSelection();
   const isCustomProfile = prefs.inputProfile === "custom";
+  const activeWebAudio = webAudioPresetForSettings(prefs);
+  const hasEnhancedProcessing =
+    activeWebAudio.highPassHz !== null ||
+    activeWebAudio.compressor !== null ||
+    activeWebAudio.noiseGateThreshold !== null;
 
   function updatePrefs(patch: Partial<VoiceVideoPreferences>) {
     setPrefs((current) => ({ ...current, ...patch }));
@@ -70,6 +80,8 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
       ...current,
       inputProfile: profile,
       processing: processingFromProfile(profile, current.processing),
+      voiceActivitySensitivity:
+        profile === "custom" ? current.voiceActivitySensitivity : profileSensitivity(profile),
     }));
   }
 
@@ -173,8 +185,12 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
       testStreamRef.current = null;
     }
 
+    testPipelineRef.current?.stop(false);
+    testPipelineRef.current = null;
+
     setTestingMic(false);
     setMicLevel(0);
+    setMicWouldTransmit(false);
   }
 
   async function handleTestMic() {
@@ -186,24 +202,30 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
     setError(null);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const rawStream = await navigator.mediaDevices.getUserMedia({
         audio: buildAudioConstraints(prefs.inputDeviceId, effectiveProcessing(prefs)),
         video: false,
       });
-      testStreamRef.current = stream;
+      testStreamRef.current = rawStream;
+
+      const pipeline = new VoiceAudioPipeline();
+      testPipelineRef.current = pipeline;
+      const processedStream = pipeline.process(rawStream, prefs);
 
       const context = new AudioContext();
       testContextRef.current = context;
-      const source = context.createMediaStreamSource(stream);
+      const source = context.createMediaStreamSource(processedStream);
       const analyser = context.createAnalyser();
       analyser.fftSize = 512;
       source.connect(analyser);
 
       const buffer = new Uint8Array(analyser.frequencyBinCount);
+      const vadThreshold = speakingThreshold(prefs.voiceActivitySensitivity);
       testIntervalRef.current = setInterval(() => {
         analyser.getByteFrequencyData(buffer);
         const average = buffer.reduce((sum, value) => sum + value, 0) / buffer.length;
         setMicLevel(Math.min(100, Math.round((average / 80) * 100)));
+        setMicWouldTransmit(!prefs.pushToTalk && average > vadThreshold);
       }, 80);
 
       setTestingMic(true);
@@ -303,24 +325,6 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
                   />
                   Automatic gain control
                 </label>
-                <label>
-                  Voice activity sensitivity
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={prefs.voiceActivitySensitivity}
-                    onChange={(event) =>
-                      updatePrefs({ voiceActivitySensitivity: Number(event.target.value) })
-                    }
-                    disabled={saving || prefs.pushToTalk}
-                  />
-                  <span className="settings-muted">
-                    {prefs.pushToTalk
-                      ? "Disabled while push-to-talk is on."
-                      : "Higher values make it harder for background noise to trigger voice activity."}
-                  </span>
-                </label>
               </>
             ) : (
               <ul className="voice-profile-summary">
@@ -337,7 +341,33 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
                   {effectiveProcessing(prefs).autoGainControl ? "On" : "Off"}
                 </li>
                 <li>Input mode: {prefs.pushToTalk ? "Push-to-talk" : "Voice activity"}</li>
+                {hasEnhancedProcessing && (
+                  <li>Enhanced filtering: high-pass, compression, and noise gate</li>
+                )}
               </ul>
+            )}
+            {!prefs.pushToTalk && (
+              <label>
+                Voice activity sensitivity
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={prefs.voiceActivitySensitivity}
+                  onChange={(event) =>
+                    updatePrefs({ voiceActivitySensitivity: Number(event.target.value) })
+                  }
+                  disabled={saving}
+                />
+                <span className="settings-muted">
+                  Higher values require louder speech before your mic transmits ({prefs.voiceActivitySensitivity})
+                </span>
+              </label>
+            )}
+            {prefs.pushToTalk && (
+              <p className="settings-muted">
+                Voice activity sensitivity is disabled while push-to-talk is on.
+              </p>
             )}
           </section>
 
@@ -381,8 +411,19 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
                 {testingMic ? "Stop Mic Test" : "Test Microphone"}
               </button>
               <div className="audio-device-meter" aria-hidden="true">
+                <div
+                  className="audio-device-meter-threshold"
+                  style={{
+                    left: `${Math.min(100, (speakingThreshold(prefs.voiceActivitySensitivity) / 80) * 100)}%`,
+                  }}
+                />
                 <div className="audio-device-meter-fill" style={{ width: `${micLevel}%` }} />
               </div>
+              {testingMic && !prefs.pushToTalk && (
+                <span className={`settings-muted mic-vad-status${micWouldTransmit ? " active" : ""}`}>
+                  {micWouldTransmit ? "Mic would transmit" : "Below voice activity threshold"}
+                </span>
+              )}
             </div>
           </section>
           </div>
@@ -433,7 +474,8 @@ export default function VoiceVideoSettingsTab({ focus }: VoiceVideoSettingsTabPr
               </select>
             </label>
             <p className="settings-muted">
-              Camera selection is saved for upcoming video features.
+              Used when you turn on your camera in voice channels. Change it here or from Voice &amp;
+              Video settings.
             </p>
           </section>
         </>

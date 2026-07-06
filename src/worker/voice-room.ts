@@ -6,6 +6,8 @@ export interface VoicePeer {
   username: string;
   muted: boolean;
   deafened: boolean;
+  serverMuted: boolean;
+  serverDeafened: boolean;
   speaking: boolean;
   cameraEnabled: boolean;
   screenSharing: boolean;
@@ -17,6 +19,8 @@ interface PeerAttachment {
   username: string;
   muted: boolean;
   deafened: boolean;
+  serverMuted: boolean;
+  serverDeafened: boolean;
   speaking: boolean;
   cameraEnabled: boolean;
   screenSharing: boolean;
@@ -65,6 +69,16 @@ export class VoiceRoom extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/moderate" && request.method === "POST") {
+      return this.handleModerate(request);
+    }
+
+    if (url.pathname === "/move" && request.method === "POST") {
+      return this.handleMove(request);
+    }
+
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade.", { status: 426 });
     }
@@ -105,6 +119,8 @@ export class VoiceRoom extends DurableObject {
       username,
       muted: false,
       deafened: false,
+      serverMuted: false,
+      serverDeafened: false,
       speaking: false,
       cameraEnabled: false,
       screenSharing: false,
@@ -203,7 +219,12 @@ export class VoiceRoom extends DurableObject {
         attachment.speaking = false;
       }
     }
-    if (payload.speaking !== undefined && !attachment.deafened) {
+    if (
+      payload.speaking !== undefined &&
+      !attachment.deafened &&
+      !attachment.serverDeafened &&
+      !attachment.serverMuted
+    ) {
       attachment.speaking = payload.speaking;
     }
     if (payload.cameraEnabled !== undefined) {
@@ -220,11 +241,118 @@ export class VoiceRoom extends DurableObject {
         userId: attachment.userId,
         muted: attachment.muted,
         deafened: attachment.deafened,
+        serverMuted: attachment.serverMuted,
+        serverDeafened: attachment.serverDeafened,
         speaking: attachment.speaking,
         cameraEnabled: attachment.cameraEnabled,
         screenSharing: attachment.screenSharing,
       }),
     );
+  }
+
+  private async handleModerate(request: Request): Promise<Response> {
+    let payload: {
+      targetUserId?: string;
+      serverMuted?: boolean;
+      serverDeafened?: boolean;
+    };
+
+    try {
+      payload = await request.json();
+    } catch {
+      return Response.json({ error: "Invalid JSON." }, { status: 400 });
+    }
+
+    if (!payload.targetUserId) {
+      return Response.json({ error: "targetUserId is required." }, { status: 400 });
+    }
+
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as PeerAttachment | null;
+      if (!attachment || attachment.userId !== payload.targetUserId) {
+        continue;
+      }
+
+      if (payload.serverMuted !== undefined) {
+        attachment.serverMuted = payload.serverMuted;
+        if (attachment.serverMuted) {
+          attachment.speaking = false;
+        }
+      }
+      if (payload.serverDeafened !== undefined) {
+        attachment.serverDeafened = payload.serverDeafened;
+        attachment.speaking = false;
+        if (attachment.serverDeafened) {
+          attachment.deafened = true;
+        }
+      }
+
+      socket.serializeAttachment(attachment);
+      this.broadcast(
+        JSON.stringify({
+          type: "peer-state",
+          userId: attachment.userId,
+          muted: attachment.muted,
+          deafened: attachment.deafened,
+          serverMuted: attachment.serverMuted,
+          serverDeafened: attachment.serverDeafened,
+          speaking: attachment.speaking,
+          cameraEnabled: attachment.cameraEnabled,
+          screenSharing: attachment.screenSharing,
+        }),
+      );
+      return Response.json({ ok: true });
+    }
+
+    return Response.json({ error: "User is not in this voice channel." }, { status: 404 });
+  }
+
+  private async handleMove(request: Request): Promise<Response> {
+    let payload: {
+      targetUserId?: string;
+      targetChannelId?: string;
+      targetChannelName?: string;
+      serverId?: string;
+      serverName?: string;
+    };
+
+    try {
+      payload = await request.json();
+    } catch {
+      return Response.json({ error: "Invalid JSON." }, { status: 400 });
+    }
+
+    if (!payload.targetUserId || !payload.targetChannelId) {
+      return Response.json({ error: "targetUserId and targetChannelId are required." }, { status: 400 });
+    }
+
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as PeerAttachment | null;
+      if (!attachment || attachment.userId !== payload.targetUserId) {
+        continue;
+      }
+
+      socket.send(
+        JSON.stringify({
+          type: "moved",
+          channelId: payload.targetChannelId,
+          channelName: payload.targetChannelName ?? "Voice",
+          serverId: payload.serverId ?? "",
+          serverName: payload.serverName ?? "",
+        }),
+      );
+      socket.close(4000, "Moved to another channel");
+      this.broadcast(
+        JSON.stringify({
+          type: "peer-left",
+          userId: attachment.userId,
+        }),
+        socket,
+      );
+      return Response.json({ ok: true });
+    }
+
+    return Response.json({ error: "User is not in this voice channel." }, { status: 404 });
   }
 
   private getPeers(): VoicePeer[] {
@@ -247,6 +375,8 @@ export class VoiceRoom extends DurableObject {
     return {
       userId: attachment.userId,
       displayName: attachment.displayName,
+      serverMuted: attachment.serverMuted,
+      serverDeafened: attachment.serverDeafened,
       username: attachment.username,
       muted: attachment.muted,
       deafened: attachment.deafened,

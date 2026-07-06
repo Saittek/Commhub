@@ -108,15 +108,22 @@ export function effectiveProcessing(prefs: VoiceVideoPreferences): VoiceProcessi
 }
 
 export function effectiveSensitivity(prefs: VoiceVideoPreferences): number {
-  if (prefs.inputProfile === "custom") {
-    return prefs.voiceActivitySensitivity;
-  }
-  return profileSensitivity(prefs.inputProfile);
+  return prefs.voiceActivitySensitivity;
 }
 
 export function speakingThreshold(sensitivity: number): number {
   const clamped = Math.min(100, Math.max(0, sensitivity));
   return 35 - (clamped / 100) * 27;
+}
+
+/** Scale a noise-gate RMS threshold from voice activity sensitivity (0 = sensitive, 100 = strict). */
+export function noiseGateThresholdForSensitivity(
+  baseThreshold: number,
+  sensitivity: number,
+): number {
+  const clamped = Math.min(100, Math.max(0, sensitivity));
+  const scale = 0.5 + (clamped / 100) * 2;
+  return baseThreshold * scale;
 }
 
 export function getVoiceVideoPreferences(): VoiceVideoPreferences {
@@ -171,6 +178,7 @@ export function buildVideoConstraints(deviceId: string): MediaTrackConstraints {
   const constraints: MediaTrackConstraints = {
     width: { ideal: 1280, max: 1920 },
     height: { ideal: 720, max: 1080 },
+    aspectRatio: { ideal: 16 / 9 },
     frameRate: { ideal: 24, max: 30 },
   };
 

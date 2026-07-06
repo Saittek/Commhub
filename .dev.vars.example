@@ -1,1 +1,5 @@
 JWT_SECRET=change-me-to-a-long-random-string-for-local-dev
+
+# Optional: GitHub OAuth (enables "Continue with GitHub" on login)
+# GITHUB_CLIENT_ID=
+# GITHUB_CLIENT_SECRET=

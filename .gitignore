@@ -7,3 +7,6 @@ dist/
 !.env.example
 .dev.vars
 !.dev.vars.example
+cookies-temp.txt
+test-login-temp*.json
+*.temp.json

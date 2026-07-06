@@ -1,22 +1,46 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { useNavigate } from "react-router-dom";
+import { FriendsIcon, HashIcon } from "../components/UiIcons";
 import ServerSidebar from "../components/ServerSidebar";
+import FriendsDmPanel from "../components/FriendsDmPanel";
 import ServerSettingsPanel from "../components/ServerSettingsPanel";
 import TextChannelPanel from "../components/TextChannelPanel";
+import VoiceStageView from "../components/VoiceStageView";
 import UserSettingsPanel from "../components/UserSettingsPanel";
 import VoiceSettingsPanel from "../components/VoiceSettingsPanel";
 import type { VoiceSettingsFocus } from "../components/VoiceVideoSettingsTab";
-import VoiceChannelPanel from "../components/VoiceChannelPanel";
+import RulesAcceptModal from "../components/RulesAcceptModal";
+import MembersPanel from "../components/MembersPanel";
 import { useAuth } from "../context/AuthContext";
 import { useVoice } from "../context/VoiceContext";
-import { getMyServers, getServerChannels, type Channel, type Server } from "../lib/api";
+import { getMyServers, getServerChannels, getChannelUnread, getServerRules, type Channel, type Server } from "../lib/api";
+import VoiceSetupModal, { VOICE_SETUP_DONE_KEY } from "../components/VoiceSetupModal";
 import { resolveHomePath } from "../lib/navigation";
+import { shouldShowVoiceStage } from "../lib/voice-stage";
+import { getVoiceVideoPreferences } from "../lib/voice-video-settings";
+import { useVoiceShortcuts } from "../hooks/useVoiceShortcuts";
+import DmPopout from "../components/DmPopout";
+
+function resolveTextChannelId(channels: Channel[], preferredId?: string | null): string | null {
+  if (preferredId) {
+    const preferred = channels.find((channel) => channel.id === preferredId);
+    if (preferred?.type === "text") {
+      return preferredId;
+    }
+  }
+  return channels.find((channel) => channel.type === "text")?.id ?? null;
+}
 
 export default function AppPage() {
   const navigate = useNavigate();
   const { user, logout } = useAuth();
+  const [showMembers, setShowMembers] = useState(true);
   const [servers, setServers] = useState<Server[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+  const [showFriends, setShowFriends] = useState(false);
+  const [openDmUserId, setOpenDmUserId] = useState<string | null>(null);
+  const [rulesGate, setRulesGate] = useState<{ serverId: string; serverName: string } | null>(null);
   const [activeServerId, setActiveServerId] = useState<string | null>(null);
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -27,12 +51,67 @@ export default function AppPage() {
   );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [dmPopoutOpen, setDmPopoutOpen] = useState(false);
+  const [voiceSetupOpen, setVoiceSetupOpen] = useState(
+    () => typeof window !== "undefined" && !localStorage.getItem(VOICE_SETUP_DONE_KEY),
+  );
+  const [joiningVoiceInvite, setJoiningVoiceInvite] = useState(false);
 
   const activeServer = servers.find((server) => server.id === activeServerId) ?? servers[0] ?? null;
-  const activeChannel =
-    channels.find((channel) => channel.id === activeChannelId) ?? channels[0] ?? null;
+  const activeTextChannel =
+    channels.find((channel) => channel.id === activeChannelId && channel.type === "text") ?? null;
 
   const voice = useVoice();
+  const inVoiceStage = shouldShowVoiceStage(voice);
+  const voiceChannel = channels.find((channel) => channel.id === voice.joined?.channelId) ?? null;
+  const pushToTalk =
+    (voiceChannel?.voicePttOnly ?? false) || getVoiceVideoPreferences().pushToTalk;
+
+  useVoiceShortcuts({
+    enabled: Boolean(voice.joined) && voice.connectionState === "connected" && !inVoiceStage,
+    pushToTalk,
+    onToggleMute: voice.toggleMute,
+    onToggleDeafen: voice.toggleDeafen,
+    onPushToTalkChange: voice.setPushToTalk,
+  });
+
+  async function handleJoinVoiceInvite(serverId: string, channelId: string) {
+    setJoiningVoiceInvite(true);
+    setLoadError(null);
+    try {
+      setShowFriends(false);
+      setDmPopoutOpen(false);
+
+      let server = servers.find((item) => item.id === serverId);
+      if (!server) {
+        const response = await getMyServers();
+        setServers(response.servers);
+        server = response.servers.find((item) => item.id === serverId);
+      }
+      if (!server) {
+        setLoadError("You are not a member of that server.");
+        return;
+      }
+
+      setActiveServerId(serverId);
+      const channelResponse = await getServerChannels(serverId);
+      setChannels(channelResponse.channels);
+      const channel = channelResponse.channels.find(
+        (item) => item.id === channelId && item.type === "voice",
+      );
+      if (!channel) {
+        setLoadError("That voice channel no longer exists.");
+        return;
+      }
+
+      voice.clearError();
+      await voice.join(server, channel);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not join voice.");
+    } finally {
+      setJoiningVoiceInvite(false);
+    }
+  }
 
   async function loadChannels(serverId: string, preferredChannelId?: string) {
     try {
@@ -45,15 +124,21 @@ export default function AppPage() {
         return;
       }
 
-      const nextId =
-        preferredChannelId &&
-        response.channels.some((channel) => channel.id === preferredChannelId)
-          ? preferredChannelId
-          : response.channels[0]?.id ?? null;
+      const nextId = resolveTextChannelId(response.channels, preferredChannelId);
 
       setActiveChannelId(nextId);
+      void loadUnread(serverId);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Could not load channels.");
+    }
+  }
+
+  async function loadUnread(serverId: string) {
+    try {
+      const response = await getChannelUnread(serverId);
+      setUnreadCounts(response.unread);
+    } catch {
+      setUnreadCounts({});
     }
   }
 
@@ -100,7 +185,22 @@ export default function AppPage() {
     void loadChannels(activeServerId);
   }, [activeServerId]);
 
+  useEffect(() => {
+    if (!activeServerId || !activeServer) {
+      setRulesGate(null);
+      return;
+    }
+    void getServerRules(activeServerId).then((rules) => {
+      if (rules.requireAcceptance && !rules.accepted) {
+        setRulesGate({ serverId: activeServerId, serverName: activeServer.name });
+      } else {
+        setRulesGate(null);
+      }
+    });
+  }, [activeServerId, activeServer?.name]);
+
   function handleServerSelect(serverId: string) {
+    setShowFriends(false);
     setActiveServerId(serverId);
   }
 
@@ -117,7 +217,9 @@ export default function AppPage() {
 
   function handleChannelCreated(channel: Channel) {
     setChannels((current) => [...current, channel]);
-    setActiveChannelId(channel.id);
+    if (channel.type === "text") {
+      setActiveChannelId(channel.id);
+    }
   }
 
   function handleChannelUpdated(channel: Channel) {
@@ -133,14 +235,25 @@ export default function AppPage() {
     setChannels((current) => {
       const next = current.filter((item) => item.id !== channelId);
       if (activeChannelId === channelId) {
-        setActiveChannelId(next[0]?.id ?? null);
+        setActiveChannelId(resolveTextChannelId(next));
       }
       return next;
     });
   }
 
+  function handleServerJoined(server: Server) {
+    handleServerCreated(server);
+  }
+
+  const showMembersPanel = Boolean(activeServer && !showFriends);
+  const hideAppHeader = Boolean(activeTextChannel) && !showFriends && !inVoiceStage;
+  const uiTextScale = (activeServer?.uiTextScale ?? 100) / 100;
+
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell${showMembersPanel && !showMembers ? " app-shell--members-collapsed" : ""}${inVoiceStage ? " app-shell--voice-stage" : ""}`}
+      style={{ "--ch-ui-scale": String(uiTextScale) } as CSSProperties}
+    >
       <aside className="app-sidebar">
         <ServerSidebar
           servers={servers}
@@ -152,7 +265,7 @@ export default function AppPage() {
               ? voice.joined.channelId
               : null
           }
-          voiceConnection={voice.isJoined ? voice.joined : null}
+          voiceConnection={voice.joined}
           voiceMuted={voice.muted}
           voiceDeafened={voice.deafened}
           onDisconnectVoice={voice.disconnect}
@@ -183,97 +296,174 @@ export default function AppPage() {
           }}
           onSelectServer={handleServerSelect}
           onServerCreated={handleServerCreated}
-          onSelectChannel={setActiveChannelId}
+          onServerJoined={handleServerJoined}
+          onSelectChannel={(channelId) => {
+            setShowFriends(false);
+            const channel = channels.find((item) => item.id === channelId);
+            if (!channel) {
+              return;
+            }
+
+            if (channel.type === "voice") {
+              if (!activeServer) {
+                return;
+              }
+              if (voice.joined?.channelId === channelId && voice.connectionState !== "disconnected") {
+                voice.disconnect();
+                return;
+              }
+              voice.clearError();
+              void voice.join(activeServer, channel);
+              return;
+            }
+
+            setActiveChannelId(channelId);
+            setUnreadCounts((current) => ({ ...current, [channelId]: 0 }));
+          }}
+          voiceError={voice.error}
+          onClearVoiceError={voice.clearError}
+          onOpenDm={() => setDmPopoutOpen(true)}
+          unreadCounts={unreadCounts}
+          showFriends={showFriends}
+          onToggleFriends={() => setShowFriends((v) => !v)}
           onChannelCreated={handleChannelCreated}
           onChannelUpdated={handleChannelUpdated}
           onChannelDeleted={handleChannelDeleted}
+          onLogout={() => {
+            void logout().then(() => navigate("/"));
+          }}
         />
       </aside>
 
       <main className="app-main">
+        {!hideAppHeader && (
         <header className="app-header">
           <div className="app-header-title">
-            <h1>
-              {activeChannel
-                ? `${activeChannel.type === "text" ? "#" : ""}${activeChannel.name}`
-                : (activeServer?.name ?? "Your Server")}
-            </h1>
+            {showFriends ? (
+              <>
+                <FriendsIcon className="app-header-channel-icon" />
+                <h1>Friends</h1>
+              </>
+            ) : activeTextChannel ? (
+              <>
+                <span className="app-header-channel-icon" aria-hidden="true">
+                  <HashIcon />
+                </span>
+                <h1>{activeTextChannel.name}</h1>
+              </>
+            ) : (
+              <h1>{activeServer?.name ?? "Your Server"}</h1>
+            )}
           </div>
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() => {
-              void logout();
-            }}
-          >
-            Log Out
-          </button>
         </header>
+        )}
 
         <section
           className={
-            activeChannel?.type === "text" ? "app-content text-channel-view" : "app-placeholder"
+            inVoiceStage
+              ? "app-content voice-stage-content"
+              : activeTextChannel
+                ? "app-content text-channel-view"
+                : "app-placeholder"
           }
         >
           {loading && <p>Loading server...</p>}
           {loadError && <div className="settings-error">{loadError}</div>}
-          {!loading && activeChannel ? (
-            activeChannel.type === "voice" ? (
-              <VoiceChannelPanel
-                channel={activeChannel}
-                connectionState={voice.connectionState}
-                error={voice.error}
-                peers={voice.peers}
-                muted={voice.muted}
-                deafened={voice.deafened}
-                localMedia={voice.localMedia}
-                remoteMedia={voice.remoteMedia}
-                isJoined={
-                  voice.isJoined && voice.joined?.channelId === activeChannel.id
-                }
-                joinedElsewhere={
-                  voice.isJoined && voice.joined?.channelId !== activeChannel.id
-                    ? voice.joined
-                    : null
-                }
-                onJoin={() => {
-                  if (activeServer) {
-                    void voice.join(activeServer, activeChannel);
-                  }
-                }}
-                onLeave={voice.disconnect}
-                onToggleMute={voice.toggleMute}
-                onToggleDeafen={voice.toggleDeafen}
-                onToggleCamera={() => {
-                  void voice.toggleCamera();
-                }}
-                onToggleScreenShare={() => {
-                  void voice.toggleScreenShare();
-                }}
-                onPushToTalkChange={voice.setPushToTalk}
-                onClearError={voice.clearError}
-              />
-            ) : (
-              user && (
-                <TextChannelPanel
-                  serverId={activeServer!.id}
-                  channelId={activeChannel.id}
-                  channelName={activeChannel.name}
-                  currentUserId={user.id}
-                />
-              )
-            )
-          ) : !loading ? (
-            <>
+          {!loading && showFriends ? (
+            <FriendsDmPanel
+              openDmUserId={openDmUserId}
+              onOpenDmHandled={() => setOpenDmUserId(null)}
+              onJoinVoiceInvite={(serverId, channelId) => void handleJoinVoiceInvite(serverId, channelId)}
+              joiningVoiceInvite={joiningVoiceInvite}
+            />
+          ) : !loading && inVoiceStage && activeServer && user && voice.joined && voice.joined.serverId === activeServer.id ? (
+            <VoiceStageView
+              serverId={activeServer.id}
+              serverName={activeServer.name}
+              channelId={voice.joined.channelId}
+              voiceChannelName={voice.joined.channelName}
+              inviteCode={activeServer.inviteCode}
+              voicePttOnly={voiceChannel?.voicePttOnly}
+              localMedia={voice.localMedia}
+              remoteMedia={voice.remoteMedia}
+              peers={voice.peers}
+              localSpeaking={voice.localSpeaking}
+              muted={voice.muted}
+              deafened={voice.deafened}
+              currentUserId={user.id}
+              currentUsername={user.displayName || user.username}
+              currentAvatarUrl={user.avatarUrl}
+              connectionState={voice.connectionState}
+              voiceError={voice.error}
+              onOpenDm={() => setDmPopoutOpen(true)}
+              onRetryConnection={() => void voice.retryVoiceConnection()}
+              onOpenMicSettings={() => {
+                setVoiceSettingsFocus("microphone");
+                setVoiceSettingsOpen(true);
+              }}
+              onOpenCameraSettings={() => {
+                setVoiceSettingsFocus("microphone");
+                setVoiceSettingsOpen(true);
+              }}
+              textChannel={
+                activeTextChannel
+                  ? {
+                      channelId: activeTextChannel.id,
+                      channelName: activeTextChannel.name,
+                      channelTopic: activeTextChannel.topic,
+                      slowModeSeconds: activeTextChannel.slowModeSeconds,
+                    }
+                  : null
+              }
+            />
+          ) : !loading && activeTextChannel && user ? (
+            <TextChannelPanel
+              serverId={activeServer!.id}
+              channelId={activeTextChannel.id}
+              channelName={activeTextChannel.name}
+              channelTopic={activeTextChannel.topic}
+              slowModeSeconds={activeTextChannel.slowModeSeconds ?? 0}
+              currentUserId={user.id}
+              onOpenDm={(userId) => {
+                setOpenDmUserId(userId);
+                setShowFriends(true);
+              }}
+            />
+          ) : !loading && !showFriends ? (
+            <div className="app-welcome">
+              <div className="app-welcome-icon" aria-hidden="true">
+                <HashIcon />
+              </div>
               <h2>Welcome to {activeServer?.name ?? "your server"}</h2>
               <p>
-                Select a # text channel to chat, or join a voice channel to talk. Use the{" "}
-                <strong>+</strong> buttons next to channel categories to create new ones.
+                Pick a text channel to start chatting, or join a voice channel from the list.
               </p>
-            </>
+            </div>
           ) : null}
         </section>
       </main>
+
+      {showMembersPanel && (
+        <MembersPanel
+          serverId={activeServer?.id ?? null}
+          serverName={activeServer?.name ?? null}
+          currentUserId={user?.id ?? ""}
+          collapsed={!showMembers}
+          onToggleCollapsed={() => setShowMembers((v) => !v)}
+          onOpenDm={(userId) => {
+            setOpenDmUserId(userId);
+            setShowFriends(true);
+          }}
+        />
+      )}
+
+      {rulesGate && (
+        <RulesAcceptModal
+          serverId={rulesGate.serverId}
+          serverName={rulesGate.serverName}
+          onAccepted={() => setRulesGate(null)}
+        />
+      )}
 
       {userSettingsOpen && (
         <UserSettingsPanel
@@ -291,6 +481,17 @@ export default function AppPage() {
             setVoiceSettingsFocus(undefined);
           }}
         />
+      )}
+
+      <DmPopout
+        open={dmPopoutOpen}
+        onClose={() => setDmPopoutOpen(false)}
+        onJoinVoiceInvite={(serverId, channelId) => void handleJoinVoiceInvite(serverId, channelId)}
+        joiningVoiceInvite={joiningVoiceInvite}
+      />
+
+      {voiceSetupOpen && (
+        <VoiceSetupModal onComplete={() => setVoiceSetupOpen(false)} />
       )}
 
       {settingsOpen && activeServer && user && (

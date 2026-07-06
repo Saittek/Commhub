@@ -14,10 +14,12 @@ import {
   normalizeSignup,
   normalizeChangePassword,
   normalizeUpdateEmail,
+  normalizeUpdateProfile,
   validateChangePassword,
   validateLogin,
   validateSignup,
   validateUpdateEmail,
+  validateUpdateProfile,
 } from "./lib/validation";
 import {
   ALLOWED_AVATAR_TYPES,
@@ -38,10 +40,12 @@ import {
   type UpdateServerInput,
 } from "./lib/servers";
 import {
-  getServerMembers,
+  listMyServers,
+  listPublicServers,
   mapServer,
   requireServerMember,
   requireServerOwner,
+  requireManageServer,
   serverIconStorageKey,
   serverIconUrl,
 } from "./lib/server-access";
@@ -50,6 +54,7 @@ import {
   listServerChannels,
   mapChannel,
   normalizeChannelName,
+  resolveVoiceUserLimit,
   validateCreateChannel,
   validateUpdateChannel,
   type ChannelType,
@@ -74,6 +79,7 @@ import {
   handleDeleteMessage,
   handleGetAttachment,
   handleGetMyPermissions,
+  handleGetThreadCounts,
   handleListMessages,
   handleListPins,
   handleMarkRead,
@@ -85,6 +91,23 @@ import {
   handleUploadAttachment,
 } from "./message-routes";
 import { memberHasPermission } from "./lib/user-permissions";
+import { getAllRankedServerMembers, touchServerPresence } from "./lib/presence";
+import {
+  registerSafetyRoutes,
+  enforceJoinSafety,
+  mapOnlineMembersForServer,
+  writeAuditLog,
+  checkVerificationLevel,
+} from "./safety-routes";
+import { registerDiscordRoutes } from "./discord-routes";
+import { registerDiscordExtraRoutes } from "./discord-routes-extra";
+import { registerDiscordCompletionRoutes } from "./discord-completion-routes";
+import { registerBotRoutes } from "./bot-routes";
+import { registerOAuthRoutes } from "./oauth-routes";
+import { registerPlatformRoutes } from "./platform-routes";
+import { isMemberTimedOut } from "./lib/discord-features";
+import { ensurePrivacySettings } from "./lib/privacy";
+import { buildUserProfile } from "./lib/user-profile";
 
 export { VoiceRoom, TextRoom };
 
@@ -109,131 +132,197 @@ function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
 }
 
+function workerErrorMessage(err: unknown): { message: string; status: number } {
+  const message = err instanceof Error ? err.message : String(err);
+
+  if (message.includes("no such table") || message.includes("no such column")) {
+    return {
+      message:
+        "Database schema is out of date. Stop the dev server, then run: npx wrangler d1 migrations apply commhub-db --local && npm run dev:clean",
+      status: 500,
+    };
+  }
+
+  if (message.includes("SQLITE_BUSY") || message.includes("database is locked")) {
+    return {
+      message: "Local database is busy. Stop other dev servers, then run: npm run dev:clean",
+      status: 503,
+    };
+  }
+
+  return {
+    message: "Internal server error.",
+    status: 500,
+  };
+}
+
+app.onError((err, _c) => {
+  console.error("[worker]", err);
+  const { message, status } = workerErrorMessage(err);
+  return jsonError(message, status);
+});
+
 app.post("/api/auth/signup", async (c) => {
-  const body = await c.req.json<{
-    username?: string;
-    email?: string;
-    password?: string;
-  }>();
+  try {
+    if (!c.env.JWT_SECRET) {
+      return jsonError("Server is missing JWT_SECRET. Copy .dev.vars.example to .dev.vars for local dev.", 503);
+    }
 
-  const input = normalizeSignup({
-    username: body.username ?? "",
-    email: body.email ?? "",
-    password: body.password ?? "",
-  });
+    const body = await c.req.json<{
+      username?: string;
+      email?: string;
+      password?: string;
+    }>();
 
-  const validationError = validateSignup(input);
-  if (validationError) {
-    return jsonError(validationError, 400);
-  }
+    const input = normalizeSignup({
+      username: body.username ?? "",
+      email: body.email ?? "",
+      password: body.password ?? "",
+    });
 
-  const existing = await c.env.DB.prepare(
-    "SELECT id FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE LIMIT 1",
-  )
-    .bind(input.username, input.email)
-    .first<{ id: string }>();
+    const validationError = validateSignup(input);
+    if (validationError) {
+      return jsonError(validationError, 400);
+    }
 
-  if (existing) {
-    return jsonError("Username or email is already taken.", 409);
-  }
+    const existing = await c.env.DB.prepare(
+      "SELECT id FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE LIMIT 1",
+    )
+      .bind(input.username, input.email)
+      .first<{ id: string }>();
 
-  const { hash, salt } = await hashPassword(input.password);
-  const id = crypto.randomUUID();
+    if (existing) {
+      return jsonError("Username or email is already taken.", 409);
+    }
 
-  await c.env.DB.prepare(
-    "INSERT INTO users (id, username, email, password_hash, password_salt, display_name) VALUES (?, ?, ?, ?, ?, ?)",
-  )
-    .bind(id, input.username, input.email, hash, salt, input.username)
-    .run();
+    const { hash, salt } = await hashPassword(input.password);
+    const id = crypto.randomUUID();
 
-  const token = await signToken(
-    {
-      sub: id,
-      username: input.username,
-      email: input.email,
-      displayName: input.username,
-    },
-    c.env.JWT_SECRET,
-  );
+    await c.env.DB.prepare(
+      "INSERT INTO users (id, username, email, password_hash, password_salt, display_name, email_verified) VALUES (?, ?, ?, ?, ?, ?, 0)",
+    )
+      .bind(id, input.username, input.email, hash, salt, input.username)
+      .run();
 
-  const cookie = setSessionCookie(token, isSecureRequest(c.req.raw));
-  return jsonWithCookie(
-    {
-      user: {
-        id,
+    await ensurePrivacySettings(c.env.DB, id);
+
+    const token = await signToken(
+      {
+        sub: id,
         username: input.username,
         email: input.email,
         displayName: input.username,
-        avatarUrl: null,
       },
-    },
-    cookie,
-    201,
-  );
+      c.env.JWT_SECRET,
+    );
+
+    const cookie = setSessionCookie(token, isSecureRequest(c.req.raw));
+    return jsonWithCookie(
+      {
+        user: {
+          id,
+          username: input.username,
+          email: input.email,
+          displayName: input.username,
+          avatarUrl: null,
+          emailVerified: false,
+        },
+      },
+      cookie,
+      201,
+    );
+  } catch (err) {
+    console.error("signup failed:", err);
+    const message =
+      err instanceof Error && err.message.includes("no such table")
+        ? "Database not initialized. Run: npx wrangler d1 migrations apply commhub-db --local"
+        : "Could not create account. Restart the dev server and try again.";
+    return jsonError(message, 500);
+  }
 });
 
 app.post("/api/auth/login", async (c) => {
-  const body = await c.req.json<{
-    usernameOrEmail?: string;
-    password?: string;
-  }>();
+  try {
+    if (!c.env.JWT_SECRET) {
+      return jsonError("Server is missing JWT_SECRET. Copy .dev.vars.example to .dev.vars for local dev.", 503);
+    }
 
-  const input = normalizeLogin({
-    usernameOrEmail: body.usernameOrEmail ?? "",
-    password: body.password ?? "",
-  });
-
-  const validationError = validateLogin(input);
-  if (validationError) {
-    return jsonError(validationError, 400);
-  }
-
-  const lookup = input.usernameOrEmail.toLowerCase();
-  const user = await c.env.DB.prepare(
-    "SELECT id, username, email, display_name, password_hash, password_salt FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE LIMIT 1",
-  )
-    .bind(lookup, lookup)
-    .first<{
-      id: string;
-      username: string;
-      email: string;
-      display_name: string;
-      password_hash: string;
-      password_salt: string;
+    const body = await c.req.json<{
+      usernameOrEmail?: string;
+      password?: string;
     }>();
 
-  if (!user) {
-    return jsonError("Invalid credentials.", 401);
-  }
+    const input = normalizeLogin({
+      usernameOrEmail: body.usernameOrEmail ?? "",
+      password: body.password ?? "",
+    });
 
-  const valid = await verifyPassword(input.password, user.password_hash, user.password_salt);
-  if (!valid) {
-    return jsonError("Invalid credentials.", 401);
-  }
+    const validationError = validateLogin(input);
+    if (validationError) {
+      return jsonError(validationError, 400);
+    }
 
-  const token = await signToken(
-    {
-      sub: user.id,
-      username: user.username,
-      email: user.email,
-      displayName: user.display_name,
-    },
-    c.env.JWT_SECRET,
-  );
+    const lookup = input.usernameOrEmail.toLowerCase();
+    const user = await c.env.DB.prepare(
+      "SELECT id, username, email, display_name, password_hash, password_salt FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE LIMIT 1",
+    )
+      .bind(lookup, lookup)
+      .first<{
+        id: string;
+        username: string;
+        email: string;
+        display_name: string;
+        password_hash: string;
+        password_salt: string;
+      }>();
 
-  const cookie = setSessionCookie(token, isSecureRequest(c.req.raw));
-  return jsonWithCookie(
-    {
-      user: {
-        id: user.id,
+    if (!user) {
+      return jsonError("Invalid credentials.", 401);
+    }
+
+    const valid = await verifyPassword(input.password, user.password_hash, user.password_salt);
+    if (!valid) {
+      return jsonError("Invalid credentials.", 401);
+    }
+
+    const row = await getUserRow(c.env.DB, user.id);
+    if (!row) {
+      return jsonError("User not found.", 404);
+    }
+
+    const token = await signToken(
+      {
+        sub: user.id,
         username: user.username,
         email: user.email,
-        displayName: user.username,
-        avatarUrl: null,
+        displayName: user.display_name,
       },
-    },
-    cookie,
-  );
+      c.env.JWT_SECRET,
+    );
+
+    const cookie = setSessionCookie(token, isSecureRequest(c.req.raw));
+    return jsonWithCookie(
+      {
+        user: sessionUserFromPayload(
+          {
+            sub: user.id,
+            username: user.username,
+            email: user.email,
+            displayName: user.display_name,
+          },
+          row,
+        ),
+      },
+      cookie,
+    );
+  } catch (err) {
+    console.error("login failed:", err);
+    const message =
+      err instanceof Error && err.message.includes("no such table")
+        ? "Database not initialized. Run: npx wrangler d1 migrations apply commhub-db --local"
+        : "Could not log in. Restart the dev server and try again.";
+    return jsonError(message, 500);
+  }
 });
 
 app.get("/api/auth/me", async (c) => {
@@ -250,32 +339,79 @@ app.get("/api/auth/me", async (c) => {
   return c.json({ user: sessionUserFromPayload(user, row) });
 });
 
+app.get("/api/users/:userId/profile", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) {
+    return user;
+  }
+
+  const targetUserId = c.req.param("userId");
+  const serverId = c.req.query("serverId") ?? null;
+
+  if (serverId) {
+    const server = await requireServerMember(c, user, serverId);
+    if (server instanceof Response) {
+      return server;
+    }
+  }
+
+  const profile = await buildUserProfile(c.env.DB, targetUserId, {
+    viewerId: user.sub,
+    serverId,
+  });
+
+  if (!profile) {
+    return jsonError("User not found.", 404);
+  }
+
+  return c.json({ profile });
+});
+
 app.patch("/api/auth/profile", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) {
     return user;
   }
 
-  const body = await c.req.json<{ email?: string }>();
-  const input = normalizeUpdateEmail({ email: body.email ?? "" });
-  const validationError = validateUpdateEmail(input);
-  if (validationError) {
-    return jsonError(validationError, 400);
+  const body = await c.req.json<{ email?: string; displayName?: string }>();
+
+  if (body.email === undefined && body.displayName === undefined) {
+    return jsonError("Provide email and/or displayName to update.", 400);
   }
 
-  const existing = await c.env.DB.prepare(
-    "SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ? LIMIT 1",
-  )
-    .bind(input.email, user.sub)
-    .first<{ id: string }>();
+  if (body.email !== undefined) {
+    const emailInput = normalizeUpdateEmail({ email: body.email });
+    const emailError = validateUpdateEmail(emailInput);
+    if (emailError) {
+      return jsonError(emailError, 400);
+    }
 
-  if (existing) {
-    return jsonError("That email is already in use.", 409);
+    const existing = await c.env.DB.prepare(
+      "SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ? LIMIT 1",
+    )
+      .bind(emailInput.email, user.sub)
+      .first<{ id: string }>();
+
+    if (existing) {
+      return jsonError("That email is already in use.", 409);
+    }
+
+    await c.env.DB.prepare("UPDATE users SET email = ?, email_verified = 0 WHERE id = ?")
+      .bind(emailInput.email, user.sub)
+      .run();
   }
 
-  await c.env.DB.prepare("UPDATE users SET email = ? WHERE id = ?")
-    .bind(input.email, user.sub)
-    .run();
+  if (body.displayName !== undefined) {
+    const profileInput = normalizeUpdateProfile({ displayName: body.displayName });
+    const profileError = validateUpdateProfile(profileInput);
+    if (profileError) {
+      return jsonError(profileError, 400);
+    }
+
+    await c.env.DB.prepare("UPDATE users SET display_name = ? WHERE id = ?")
+      .bind(profileInput.displayName, user.sub)
+      .run();
+  }
 
   const row = await getUserRow(c.env.DB, user.sub);
   if (!row) {
@@ -287,13 +423,26 @@ app.patch("/api/auth/profile", async (c) => {
       sub: user.sub,
       username: row.username,
       email: row.email,
-      displayName: row.username,
+      displayName: row.display_name,
     },
     c.env.JWT_SECRET,
   );
 
   const cookie = setSessionCookie(token, isSecureRequest(c.req.raw));
-  return jsonWithCookie({ user: sessionUserFromPayload(user, row) }, cookie);
+  return jsonWithCookie(
+    {
+      user: sessionUserFromPayload(
+        {
+          sub: user.sub,
+          username: row.username,
+          email: row.email,
+          displayName: row.display_name,
+        },
+        row,
+      ),
+    },
+    cookie,
+  );
 });
 
 app.post("/api/auth/password", async (c) => {
@@ -436,24 +585,7 @@ app.get("/api/servers/mine", async (c) => {
     return user;
   }
 
-  const result = await c.env.DB.prepare(
-    `SELECT s.id, s.name, s.invite_code, s.owner_id, s.created_at, s.icon_url
-     FROM servers s
-     INNER JOIN server_members sm ON sm.server_id = s.id
-     WHERE sm.user_id = ?
-     ORDER BY sm.joined_at ASC`,
-  )
-    .bind(user.sub)
-    .all<{
-      id: string;
-      name: string;
-      invite_code: string;
-      owner_id: string;
-      created_at: string;
-      icon_url: string | null;
-    }>();
-
-  const rows = result.results ?? [];
+  const rows = await listMyServers(c.env.DB, user.sub);
   return c.json({
     servers: rows.map((server) => ({
       id: server.id,
@@ -462,6 +594,25 @@ app.get("/api/servers/mine", async (c) => {
       ownerId: server.owner_id,
       createdAt: server.created_at,
       iconUrl: serverIconUrl(server.id, server.icon_url),
+      uiTextScale: server.ui_text_scale ?? 100,
+    })),
+  });
+});
+
+app.get("/api/servers/public", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) {
+    return user;
+  }
+
+  const rows = await listPublicServers(c.env.DB, user.sub);
+  return c.json({
+    servers: rows.map((server) => ({
+      id: server.id,
+      name: server.name,
+      description: server.description,
+      iconUrl: serverIconUrl(server.id, server.icon_url),
+      memberCount: server.member_count,
     })),
   });
 });
@@ -521,25 +672,50 @@ app.post("/api/servers/join", async (c) => {
     return user;
   }
 
-  const body = await c.req.json<{ inviteCode?: string }>();
-  const input = normalizeJoinServer({ inviteCode: body.inviteCode ?? "" });
+  const body = await c.req.json<{ inviteCode?: string; serverId?: string }>();
+  const input = normalizeJoinServer({
+    inviteCode: body.inviteCode,
+    serverId: body.serverId,
+  });
   const validationError = validateJoinServer(input);
   if (validationError) {
     return jsonError(validationError, 400);
   }
 
-  const server = await c.env.DB.prepare(
-    `SELECT id, name, invite_code, owner_id, invites_paused
-     FROM servers WHERE invite_code = ? COLLATE NOCASE LIMIT 1`,
-  )
-    .bind(input.inviteCode)
-    .first<{
-      id: string;
-      name: string;
-      invite_code: string;
-      owner_id: string;
-      invites_paused: number;
-    }>();
+  let server: {
+    id: string;
+    name: string;
+    invite_code: string;
+    owner_id: string;
+    invites_paused: number;
+  } | null = null;
+
+  if (input.serverId) {
+    try {
+      server = await c.env.DB.prepare(
+        `SELECT id, name, invite_code, owner_id, invites_paused
+         FROM servers WHERE id = ? AND is_public = 1 LIMIT 1`,
+      )
+        .bind(input.serverId)
+        .first();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("no such column") || !message.includes("is_public")) {
+        throw error;
+      }
+    }
+
+    if (!server) {
+      return jsonError("Server not found or is not listed publicly.", 404);
+    }
+  } else {
+    server = await c.env.DB.prepare(
+      `SELECT id, name, invite_code, owner_id, invites_paused
+       FROM servers WHERE invite_code = ? COLLATE NOCASE LIMIT 1`,
+    )
+      .bind(input.inviteCode)
+      .first();
+  }
 
   if (!server) {
     return jsonError("Invalid invite code.", 404);
@@ -547,6 +723,11 @@ app.post("/api/servers/join", async (c) => {
 
   if (server.invites_paused === 1) {
     return jsonError("Invites are paused for this server.", 403);
+  }
+
+  const banError = await enforceJoinSafety(c, server.id, user.sub);
+  if (banError) {
+    return banError;
   }
 
   const existingMember = await c.env.DB.prepare(
@@ -594,7 +775,19 @@ app.get("/api/servers/:serverId", async (c) => {
     return server;
   }
 
-  return c.json({ server: mapServer(server) });
+  const canViewInvite = await memberHasPermission(
+    c.env.DB,
+    server.id,
+    user.sub,
+    server.owner_id,
+    "create_invite",
+  );
+  const mapped = mapServer(server);
+  if (!canViewInvite && server.owner_id !== user.sub) {
+    return c.json({ server: { ...mapped, inviteCode: "" } });
+  }
+
+  return c.json({ server: mapped });
 });
 
 app.patch("/api/servers/:serverId", async (c) => {
@@ -603,9 +796,14 @@ app.patch("/api/servers/:serverId", async (c) => {
     return user;
   }
 
-  const server = await requireServerOwner(c, user, c.req.param("serverId"));
+  const server = await requireServerMember(c, user, c.req.param("serverId"));
   if (server instanceof Response) {
     return server;
+  }
+
+  const allowed = await requireManageServer(c, user, server);
+  if (allowed instanceof Response) {
+    return allowed;
   }
 
   const body = await c.req.json<UpdateServerInput>();
@@ -648,6 +846,14 @@ app.patch("/api/servers/:serverId", async (c) => {
   if (body.afkTimeoutMinutes !== undefined) {
     updates.push("afk_timeout_minutes = ?");
     values.push(body.afkTimeoutMinutes);
+  }
+  if (body.uiTextScale !== undefined) {
+    updates.push("ui_text_scale = ?");
+    values.push(body.uiTextScale);
+  }
+  if (body.isPublic !== undefined) {
+    updates.push("is_public = ?");
+    values.push(body.isPublic ? 1 : 0);
   }
 
   if (updates.length === 0) {
@@ -791,17 +997,50 @@ app.get("/api/servers/:serverId/members", async (c) => {
     return server;
   }
 
-  const members = await getServerMembers(c.env.DB, server.id);
+  const members = await getAllRankedServerMembers(c.env.DB, server.id, server.owner_id);
   return c.json({
     members: members.map((member) => ({
-      id: member.id,
-      userId: member.user_id,
+      id: member.membershipId,
+      userId: member.userId,
       username: member.username,
-      displayName: member.display_name,
-      joinedAt: member.joined_at,
-      isOwner: member.is_owner === 1,
+      displayName: member.displayName,
+      nickname: member.nickname,
+      joinedAt: member.joinedAt,
+      isOwner: member.isOwner,
+      avatarUrl: member.avatarUrl,
+      displayRole: member.displayRole,
     })),
   });
+});
+
+app.post("/api/servers/:serverId/presence/heartbeat", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) {
+    return user;
+  }
+
+  const server = await requireServerMember(c, user, c.req.param("serverId"));
+  if (server instanceof Response) {
+    return server;
+  }
+
+  await touchServerPresence(c.env.DB, server.id, user.sub);
+  return c.json({ ok: true });
+});
+
+app.get("/api/servers/:serverId/online-members", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) {
+    return user;
+  }
+
+  const server = await requireServerMember(c, user, c.req.param("serverId"));
+  if (server instanceof Response) {
+    return server;
+  }
+
+  await touchServerPresence(c.env.DB, server.id, user.sub);
+  return c.json(await mapOnlineMembersForServer(c, server));
 });
 
 app.delete("/api/servers/:serverId/members/:userId", async (c) => {
@@ -810,7 +1049,7 @@ app.delete("/api/servers/:serverId/members/:userId", async (c) => {
     return user;
   }
 
-  const server = await requireServerOwner(c, user, c.req.param("serverId"));
+  const server = await requireServerMember(c, user, c.req.param("serverId"));
   if (server instanceof Response) {
     return server;
   }
@@ -820,9 +1059,30 @@ app.delete("/api/servers/:serverId/members/:userId", async (c) => {
     return jsonError("You cannot remove the server owner.", 400);
   }
 
+  const allowed =
+    server.owner_id === user.sub ||
+    (await memberHasPermission(
+      c.env.DB,
+      server.id,
+      user.sub,
+      server.owner_id,
+      "kick_members",
+    ));
+  if (!allowed) {
+    return jsonError("You do not have permission to kick members.", 403);
+  }
+
   await c.env.DB.prepare("DELETE FROM server_members WHERE server_id = ? AND user_id = ?")
     .bind(server.id, targetUserId)
     .run();
+
+  await writeAuditLog(c.env.DB, {
+    serverId: server.id,
+    actorUserId: user.sub,
+    actionType: "member_kick",
+    targetType: "user",
+    targetId: targetUserId,
+  });
 
   return c.json({ ok: true });
 });
@@ -1019,6 +1279,26 @@ app.patch("/api/servers/:serverId/channels/:channelId", async (c) => {
     updates.push("voice_ptt_only = ?");
     values.push(body.voicePttOnly ? 1 : 0);
   }
+  if (body.topic !== undefined) {
+    updates.push("topic = ?");
+    values.push(body.topic.trim());
+  }
+  if (body.slowModeSeconds !== undefined) {
+    updates.push("slow_mode_seconds = ?");
+    values.push(body.slowModeSeconds);
+  }
+  if (body.nsfw !== undefined) {
+    updates.push("nsfw = ?");
+    values.push(body.nsfw ? 1 : 0);
+  }
+  if (body.categoryId !== undefined) {
+    updates.push("category_id = ?");
+    values.push(body.categoryId ?? "");
+  }
+  if (body.position !== undefined) {
+    updates.push("position = ?");
+    values.push(body.position);
+  }
 
   if (updates.length === 0) {
     return jsonError("No channel changes to save.", 400);
@@ -1101,6 +1381,34 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
     return jsonError("This channel is not a voice channel.", 400);
   }
 
+  const verificationError = await checkVerificationLevel(c.env.DB, server, user.sub);
+  if (verificationError) {
+    return jsonError(verificationError, 403);
+  }
+
+  const canConnect = await memberHasPermission(
+    c.env.DB,
+    server.id,
+    user.sub,
+    server.owner_id,
+    "connect_voice",
+  );
+  if (!canConnect) {
+    return jsonError("You do not have permission to join voice channels.", 403);
+  }
+
+  if (await isMemberTimedOut(c.env.DB, server.id, user.sub)) {
+    return jsonError("You are timed out and cannot join voice channels.", 403);
+  }
+
+  const canSpeak = await memberHasPermission(
+    c.env.DB,
+    server.id,
+    user.sub,
+    server.owner_id,
+    "speak_voice",
+  );
+
   const profile = await c.env.DB.prepare(
     "SELECT username, display_name FROM users WHERE id = ? LIMIT 1",
   )
@@ -1111,12 +1419,27 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
     return jsonError("User not found.", 404);
   }
 
+  let displayName = profile.display_name;
+  try {
+    const nicknameRow = await c.env.DB.prepare(
+      "SELECT nickname FROM server_members WHERE server_id = ? AND user_id = ? LIMIT 1",
+    )
+      .bind(server.id, user.sub)
+      .first<{ nickname: string | null }>();
+    if (nicknameRow?.nickname?.trim()) {
+      displayName = nicknameRow.nickname.trim();
+    }
+  } catch {
+    // nickname column may not exist before migration.
+  }
+
   try {
     const headers = new Headers(c.req.raw.headers);
     headers.set("X-User-Id", user.sub);
-    headers.set("X-Display-Name", profile.display_name);
+    headers.set("X-Display-Name", displayName);
     headers.set("X-Username", profile.username);
-    headers.set("X-Voice-User-Limit", String(channel.voice_user_limit));
+    headers.set("X-Voice-User-Limit", String(resolveVoiceUserLimit(channel.voice_user_limit)));
+    headers.set("X-Can-Speak", canSpeak ? "1" : "0");
 
     const roomId = c.env.VOICE_ROOM.idFromName(channelId);
     const stub = c.env.VOICE_ROOM.get(roomId);
@@ -1141,6 +1464,14 @@ app.get("/api/servers/:serverId/channels/:channelId/messages", async (c) => {
     return user;
   }
   return handleListMessages(c, user, c.req.param("serverId"), c.req.param("channelId"));
+});
+
+app.get("/api/servers/:serverId/channels/:channelId/thread-counts", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) {
+    return user;
+  }
+  return handleGetThreadCounts(c, user, c.req.param("serverId"), c.req.param("channelId"));
 });
 
 app.post("/api/servers/:serverId/channels/:channelId/messages", async (c) => {
@@ -1383,7 +1714,7 @@ app.post("/api/servers/:serverId/roles", async (c) => {
       roleId,
       server.id,
       body.name.trim(),
-      body.color ?? "#5865f2",
+      body.color ?? "#14b8a6",
       position,
       JSON.stringify(permissions),
     )
@@ -1603,5 +1934,13 @@ app.delete("/api/servers/:serverId/members/:userId/roles/:roleId", async (c) => 
 
   return c.json({ ok: true });
 });
+
+registerSafetyRoutes(app);
+registerDiscordRoutes(app);
+registerDiscordExtraRoutes(app);
+registerDiscordCompletionRoutes(app);
+registerBotRoutes(app);
+registerOAuthRoutes(app);
+registerPlatformRoutes(app);
 
 export default app;

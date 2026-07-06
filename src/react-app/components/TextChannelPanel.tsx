@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addReaction,
   deleteMessage,
@@ -6,25 +6,48 @@ import {
   getChannelMessages,
   getMyPermissions,
   getPinnedMessages,
+  getServerEmojis,
   getServerMembers,
+  getThreadCounts,
   markChannelRead,
   pinMessage,
   removeReaction,
+  reportContent,
+  searchMessages,
   sendMessage,
   unpinMessage,
+  updateThreadSettings,
   uploadAttachment,
   type Message,
+  type MessageResponse,
   type RolePermissions,
+  type SearchResult,
+  type ServerEmoji,
   type ServerMember,
 } from "../lib/api";
-import { formatMessageTime, QUICK_REACTIONS, renderMessageContent } from "../lib/message-format";
+import {
+  formatDateDivider,
+  isDifferentDay,
+  messageMentionsUser,
+} from "../lib/message-format";
+import { shouldGroupWithPrevious } from "../lib/message-utils";
 import { TextChannelClient, type TextSocketEvent } from "../lib/text-client";
+import { useAuth } from "../context/AuthContext";
+import { useNotifications } from "../context/NotificationContext";
+import EmojiPicker from "./EmojiPicker";
+import TextChannelMessage from "./TextChannelMessage";
+import UserProfilePopover from "./UserProfilePopover";
+import { ArrowDownIcon, AttachIcon, HashIcon, PinIcon, ReplyIcon, SearchIcon, SendIcon } from "./UiIcons";
 
 interface TextChannelPanelProps {
   serverId: string;
   channelId: string;
   channelName: string;
+  channelTopic?: string | null;
+  slowModeSeconds?: number;
   currentUserId: string;
+  embedded?: boolean;
+  onOpenDm?: (userId: string) => void;
 }
 
 interface PendingUpload {
@@ -40,38 +63,16 @@ function hasPerm(permissions: RolePermissions | null, key: keyof RolePermissions
   return permissions.administrator === true || permissions[key] === true;
 }
 
-function MoreIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-      <path
-        fill="currentColor"
-        d="M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4m0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4m0 8a2 2 0 1 0 0 4 2 2 0 0 0 0-4"
-      />
-    </svg>
-  );
-}
-
-function AddReactionIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none">
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.75" />
-      <circle cx="9" cy="10" r="1.25" fill="currentColor" />
-      <circle cx="15" cy="10" r="1.25" fill="currentColor" />
-      <path
-        d="M8.25 14.25c1.1 1.35 2.45 2.1 3.75 2.1s2.65-.75 3.75-2.1"
-        stroke="currentColor"
-        strokeWidth="1.75"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
 
 export default function TextChannelPanel({
   serverId,
   channelId,
   channelName,
+  channelTopic,
+  slowModeSeconds = 0,
   currentUserId,
+  embedded = false,
+  onOpenDm,
 }: TextChannelPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [permissions, setPermissions] = useState<RolePermissions | null>(null);
@@ -94,6 +95,23 @@ export default function TextChannelPanel({
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [menuMessageId, setMenuMessageId] = useState<string | null>(null);
   const [reactionPickerMessageId, setReactionPickerMessageId] = useState<string | null>(null);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [reportNotice, setReportNotice] = useState<string | null>(null);
+  const [threadCounts, setThreadCounts] = useState<Record<string, number>>({});
+  const [showJumpToPresent, setShowJumpToPresent] = useState(false);
+  const [serverEmojis, setServerEmojis] = useState<ServerEmoji[]>([]);
+  const [threadLocked, setThreadLocked] = useState(false);
+  const [profileAnchor, setProfileAnchor] = useState<{
+    userId: string;
+    rect: DOMRect;
+  } | null>(null);
+
+  const { user } = useAuth();
+  const { pushNotification } = useNotifications();
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<TextChannelClient | null>(null);
@@ -101,6 +119,34 @@ export default function TextChannelPanel({
   const stickToBottomRef = useRef(true);
 
   const activeThreadId = threadRoot?.id ?? null;
+
+  async function handleSearch() {
+    if (searchQuery.trim().length < 2) return;
+    setSearching(true);
+    try {
+      const response = await searchMessages(serverId, searchQuery.trim());
+      setSearchResults(response.results);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Search failed.");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function handleReport(message: Message) {
+    const reason = window.prompt("Why are you reporting this message?");
+    if (!reason?.trim()) return;
+    try {
+      await reportContent(serverId, {
+        targetType: "message",
+        targetId: message.id,
+        reason: reason.trim(),
+      });
+      setReportNotice("Report submitted. Moderators will review it.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not submit report.");
+    }
+  }
 
   const mentionCandidates = useMemo(() => {
     if (mentionQuery === null) {
@@ -115,6 +161,19 @@ export default function TextChannelPanel({
       )
       .slice(0, 6);
   }, [members, mentionQuery]);
+
+  const authorMetaByUserId = useMemo(() => {
+    const map = new Map<string, { color?: string; roleName?: string }>();
+    for (const member of members) {
+      if (member.displayRole) {
+        map.set(member.userId, {
+          color: member.displayRole.color,
+          roleName: member.displayRole.name,
+        });
+      }
+    }
+    return map;
+  }, [members]);
 
   const upsertMessage = useCallback((message: Message) => {
     setMessages((current) => {
@@ -134,7 +193,32 @@ export default function TextChannelPanel({
     (event: TextSocketEvent) => {
       if (event.type === "message-create" || event.type === "message-update") {
         const message = event.message;
-        if ((message.threadRootId ?? null) !== activeThreadId) {
+        const msgThread = message.threadRootId ?? null;
+
+        if (event.type === "message-create" && message.author.id !== currentUserId) {
+          const wrongContext = msgThread !== activeThreadId;
+          const isMention = user ? messageMentionsUser(message.content, user.username) : false;
+          if (wrongContext || isMention) {
+            const preview = message.content.slice(0, 120) || "Attachment";
+            pushNotification({
+              title: isMention
+                ? `${message.author.displayName} mentioned you`
+                : `${message.author.displayName} in #${channelName}`,
+              body: preview,
+              type: isMention ? "mention" : "message",
+              channelId,
+              serverId,
+            });
+          }
+        }
+
+        if (msgThread !== activeThreadId) {
+          if (event.type === "message-create" && msgThread && !activeThreadId) {
+            setThreadCounts((current) => ({
+              ...current,
+              [msgThread]: (current[msgThread] ?? 0) + 1,
+            }));
+          }
           return;
         }
         upsertMessage(message);
@@ -158,7 +242,16 @@ export default function TextChannelPanel({
         setTypingUsers((current) => current.filter((name) => name !== event.displayName));
       }
     },
-    [activeThreadId, currentUserId, upsertMessage],
+    [
+      activeThreadId,
+      channelId,
+      channelName,
+      currentUserId,
+      pushNotification,
+      serverId,
+      upsertMessage,
+      user,
+    ],
   );
 
   const loadMessages = useCallback(
@@ -206,15 +299,17 @@ export default function TextChannelPanel({
       setTypingUsers([]);
 
       try {
-        const [perms, memberList] = await Promise.all([
+        const [perms, memberList, threads] = await Promise.all([
           getMyPermissions(serverId),
           getServerMembers(serverId),
+          !activeThreadId ? getThreadCounts(serverId, channelId) : Promise.resolve({ counts: {} }),
         ]);
         if (cancelled) {
           return;
         }
         setPermissions(perms.permissions);
         setMembers(memberList.members);
+        setThreadCounts(threads.counts);
         await loadMessages({ replace: true });
         if (!cancelled) {
           requestAnimationFrame(() => {
@@ -237,6 +332,16 @@ export default function TextChannelPanel({
       cancelled = true;
     };
   }, [serverId, channelId, activeThreadId, loadMessages]);
+
+  useEffect(() => {
+    void getServerEmojis(serverId)
+      .then((response) => setServerEmojis(response.emojis))
+      .catch(() => setServerEmojis([]));
+  }, [serverId]);
+
+  useEffect(() => {
+    setThreadLocked(false);
+  }, [threadRoot?.id]);
 
   useEffect(() => {
     clientRef.current?.disconnect();
@@ -270,7 +375,12 @@ export default function TextChannelPanel({
       if (!(target instanceof Element)) {
         return;
       }
-      if (!target.closest(".message-menu") && !target.closest(".message-reaction-picker-wrap")) {
+      if (
+        !target.closest(".message-hover-btn") &&
+        !target.closest(".message-menu-dropdown-floating") &&
+        !target.closest(".message-reaction-picker-wrap") &&
+        !target.closest(".emoji-picker-wrap")
+      ) {
         setMenuMessageId(null);
         setReactionPickerMessageId(null);
       }
@@ -293,6 +403,7 @@ export default function TextChannelPanel({
 
     const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
     stickToBottomRef.current = distanceFromBottom < 80;
+    setShowJumpToPresent(distanceFromBottom >= 120);
 
     if (element.scrollTop < 80 && hasMore && !loadingOlder) {
       const oldest = messages[0];
@@ -313,6 +424,25 @@ export default function TextChannelPanel({
     }
   }
 
+  function scrollToBottom(smooth = true) {
+    listRef.current?.scrollTo({
+      top: listRef.current.scrollHeight,
+      behavior: smooth ? "smooth" : "auto",
+    });
+    stickToBottomRef.current = true;
+    setShowJumpToPresent(false);
+  }
+
+  function scrollToMessage(messageId: string) {
+    document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function openThread(message: Message) {
+    setThreadRoot(message);
+    setThreadLocked(message.threadLocked ?? false);
+    closeMessageMenus();
+  }
+
   function updateMentionState(value: string, caret: number) {
     const before = value.slice(0, caret);
     const match = /(^|\s)@([a-zA-Z0-9_.-]*)$/.exec(before);
@@ -322,6 +452,36 @@ export default function TextChannelPanel({
   function insertMention(username: string) {
     setDraft((current) => current.replace(/@([a-zA-Z0-9_.-]*)$/, `@${username} `));
     setMentionQuery(null);
+  }
+
+  function insertEmoji(value: string) {
+    setDraft((current) => `${current}${value}`);
+    composerRef.current?.focus();
+  }
+
+  async function handleArchiveThread() {
+    if (!threadRoot) return;
+    try {
+      await updateThreadSettings(serverId, channelId, threadRoot.id, { archived: true });
+      setThreadRoot(null);
+      setThreadLocked(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not archive thread.");
+    }
+  }
+
+  async function handleToggleThreadLock() {
+    if (!threadRoot) return;
+    const next = !threadLocked;
+    try {
+      await updateThreadSettings(serverId, channelId, threadRoot.id, { locked: next });
+      setThreadLocked(next);
+      setThreadRoot((current) =>
+        current ? { ...current, threadLocked: next } : current,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update thread.");
+    }
   }
 
   function notifyTyping() {
@@ -343,13 +503,45 @@ export default function TextChannelPanel({
     setSending(true);
     setError(null);
     try {
-      const response = await sendMessage(serverId, channelId, {
+      const response = (await sendMessage(serverId, channelId, {
         content,
         threadRootId: activeThreadId,
         replyToId: replyTo?.id ?? null,
         attachmentIds: pendingUploads.map((upload) => upload.id),
-      });
-      upsertMessage(response.message);
+      })) as MessageResponse | { slashResponse: boolean; content: string };
+
+      if ("slashResponse" in response && response.slashResponse) {
+        upsertMessage({
+          id: `slash-${Date.now()}`,
+          channelId,
+          serverId,
+          author: { id: "slash", username: "command", displayName: "Slash Command" },
+          content: response.content,
+          threadRootId: activeThreadId,
+          replyToId: null,
+          replyTo: null,
+          createdAt: new Date().toISOString(),
+          editedAt: null,
+          deletedAt: null,
+          pinned: false,
+          attachments: [],
+          reactions: [],
+          embeds: [],
+          threadArchived: false,
+          threadLocked: false,
+        });
+      } else {
+        upsertMessage((response as MessageResponse).message);
+        if (activeThreadId) {
+          setThreadCounts((current) => ({
+            ...current,
+            [activeThreadId]: (current[activeThreadId] ?? 0) + 1,
+          }));
+        }
+        if (!activeThreadId) {
+          void markChannelRead(serverId, channelId, (response as MessageResponse).message.id);
+        }
+      }
       setDraft("");
       setReplyTo(null);
       setMentionQuery(null);
@@ -363,9 +555,6 @@ export default function TextChannelPanel({
       requestAnimationFrame(() => {
         listRef.current?.scrollTo({ top: listRef.current?.scrollHeight ?? 0, behavior: "smooth" });
       });
-      if (!activeThreadId) {
-        void markChannelRead(serverId, channelId, response.message.id);
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not send message.");
     } finally {
@@ -453,267 +642,249 @@ export default function TextChannelPanel({
   const canAttach = hasPerm(permissions, "attach_files");
 
   return (
-    <div className="text-channel-panel">
+    <div className={`text-channel-panel${embedded ? " text-channel-panel--embedded" : ""}`}>
+      {(!embedded || threadRoot) && (
       <div className="text-channel-toolbar">
-        <div>
-          <h2>{threadRoot ? `Thread: ${threadRoot.author.displayName}` : `#${channelName}`}</h2>
-          {threadRoot && (
+        {threadRoot ? (
+          <div className="text-channel-thread-header">
             <button type="button" className="text-channel-back" onClick={() => setThreadRoot(null)}>
-              ← Back to #{channelName}
+              ← Back
             </button>
-          )}
-        </div>
+            <div>
+              <h2>Thread{threadLocked ? " (locked)" : ""}</h2>
+              <p>
+                {threadRoot.author.displayName}: {threadRoot.content || "Attachment"}
+              </p>
+            </div>
+            {canManageMessages && (
+              <div className="text-channel-thread-actions">
+                <button
+                  type="button"
+                  className="icon-button"
+                  title={threadLocked ? "Unlock thread" : "Lock thread"}
+                  onClick={handleToggleThreadLock}
+                >
+                  {threadLocked ? "Unlock" : "Lock"}
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="Archive thread"
+                  onClick={handleArchiveThread}
+                >
+                  Archive
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-channel-toolbar-title">
+            <HashIcon className="text-channel-toolbar-hash" />
+            <span>{channelName}</span>
+            {slowModeSeconds > 0 && (
+              <span className="text-channel-slowmode" title="Slow mode enabled">
+                {slowModeSeconds}s
+              </span>
+            )}
+          </div>
+        )}
         <div className="text-channel-toolbar-actions">
-          <span className={`text-channel-status ${connected ? "online" : ""}`}>
-            {connected ? "Live" : "Reconnecting…"}
+          <span className={`text-channel-status ${connected ? "online" : ""}`} title={connected ? "Connected" : "Reconnecting"}>
+            <span className="text-channel-status-dot" />
           </span>
           {!threadRoot && (
-            <button type="button" className="icon-button" onClick={() => setShowPins((value) => !value)}>
-              📌 Pins{pins.length ? ` (${pins.length})` : ""}
+            <button
+              type="button"
+              className={`icon-button${showSearch ? " active" : ""}`}
+              onClick={() => setShowSearch((v) => !v)}
+              title="Search"
+              aria-label="Search messages"
+            >
+              <SearchIcon />
+            </button>
+          )}
+          {!threadRoot && (
+            <button
+              type="button"
+              className={`icon-button icon-button-badge${showPins ? " active" : ""}`}
+              onClick={() => setShowPins((value) => !value)}
+              title="Pinned messages"
+              aria-label={`Pinned messages${pins.length ? `, ${pins.length}` : ""}`}
+            >
+              <PinIcon />
+              {pins.length > 0 && <span className="icon-button-count">{pins.length}</span>}
             </button>
           )}
         </div>
       </div>
+      )}
 
       {error && <div className="settings-error text-channel-error">{error}</div>}
+      {reportNotice && <div className="settings-success text-channel-notice">{reportNotice}</div>}
+
+      {showSearch && !threadRoot && (
+        <div className="message-search-panel">
+          <SearchIcon className="message-search-icon" />
+          <input
+            type="search"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder={`Search in #${channelName}`}
+            onKeyDown={(e) => e.key === "Enter" && void handleSearch()}
+          />
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => void handleSearch()}
+            disabled={searching}
+            title="Search"
+            aria-label="Search"
+          >
+            <SearchIcon />
+          </button>
+          {searchResults.length > 0 && (
+            <ul className="message-search-results">
+              {searchResults.map((result) => (
+                <li key={result.messageId}>
+                  <button type="button" onClick={() => scrollToMessage(result.messageId)}>
+                    <strong>#{result.channelName}</strong>
+                    <span>
+                      {result.author.displayName}: {result.content}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       <div className="text-channel-body">
-        <div className="text-channel-messages" ref={listRef} onScroll={handleScroll}>
-          {loadingOlder && <p className="text-channel-meta">Loading older messages…</p>}
-          {loading && <p className="text-channel-meta">Loading messages…</p>}
-          {!loading && messages.length === 0 && (
-            <p className="text-channel-meta">
-              {threadRoot
-                ? "No replies yet. Start the conversation."
-                : `This is the beginning of #${channelName}.`}
-            </p>
-          )}
+        <div className="text-channel-messages-wrap">
+          <div className="text-channel-messages" ref={listRef} onScroll={handleScroll}>
+            {loadingOlder && <p className="text-channel-meta">Loading older messages…</p>}
 
-          {messages.map((message) => {
-            const isDeleted = Boolean(message.deletedAt);
-            const isEditing = editingId === message.id;
-            const canEdit = !isDeleted && message.author.id === currentUserId;
-            const canDelete =
-              !isDeleted && (message.author.id === currentUserId || canManageMessages);
+            {!threadRoot && !loading && (
+              <div className="text-channel-start">
+                <div className="text-channel-start-icon" aria-hidden="true">
+                  <HashIcon />
+                </div>
+                <h3>Welcome to #{channelName}!</h3>
+                {channelTopic && <p className="text-channel-start-topic">{channelTopic}</p>}
+                <p className="text-channel-start-hint">
+                  This is the start of the #{channelName} channel.
+                </p>
+              </div>
+            )}
 
-            return (
-              <article
-                key={message.id}
-                id={`message-${message.id}`}
-                className={`message-item${isDeleted ? " deleted" : ""}`}
-              >
-                <header className="message-header">
-                  <div className="message-header-meta">
-                    <strong>{message.author.displayName}</strong>
-                    <span className="message-time">{formatMessageTime(message.createdAt)}</span>
-                    {message.editedAt && <span className="message-edited">(edited)</span>}
-                    {message.pinned && <span className="message-pinned">📌</span>}
-                  </div>
-                  {!isDeleted && !isEditing && (
-                    <div className="message-menu">
-                      <button
-                        type="button"
-                        className="message-menu-trigger"
-                        aria-label="Message options"
-                        aria-expanded={menuMessageId === message.id}
-                        onClick={() => {
-                          setReactionPickerMessageId(null);
-                          setMenuMessageId((current) =>
-                            current === message.id ? null : message.id,
-                          );
-                        }}
-                      >
-                        <MoreIcon />
-                      </button>
-                      {menuMessageId === message.id && (
-                        <div className="message-menu-dropdown" role="menu">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            onClick={() => {
-                              setReplyTo(message);
-                              closeMessageMenus();
-                            }}
-                          >
-                            Reply
-                          </button>
-                          {canEdit && (
-                            <button
-                              type="button"
-                              role="menuitem"
-                              onClick={() => {
-                                setEditingId(message.id);
-                                setEditDraft(message.content);
-                                closeMessageMenus();
-                              }}
-                            >
-                              Edit
-                            </button>
-                          )}
-                          {canDelete && (
-                            <button
-                              type="button"
-                              role="menuitem"
-                              onClick={() => {
-                                void handleDelete(message.id);
-                                closeMessageMenus();
-                              }}
-                            >
-                              Delete
-                            </button>
-                          )}
-                          {canManageMessages && (
-                            <button
-                              type="button"
-                              role="menuitem"
-                              onClick={() => {
-                                void handleTogglePin(message);
-                                closeMessageMenus();
-                              }}
-                            >
-                              {message.pinned ? "Unpin" : "Pin"}
-                            </button>
-                          )}
-                        </div>
-                      )}
+            {threadRoot && !loading && messages.length === 0 && (
+              <div className="text-channel-start text-channel-start-compact">
+                <h3>Thread starter</h3>
+                <p>{threadRoot.content || "Attachment"}</p>
+              </div>
+            )}
+
+            {loading && <p className="text-channel-meta">Loading messages…</p>}
+
+            {messages.map((message, index) => {
+              const prev = index > 0 ? messages[index - 1] : undefined;
+              const grouped = shouldGroupWithPrevious(prev, message);
+              const showDateDivider = !prev || isDifferentDay(prev.createdAt, message.createdAt);
+              const authorMeta = authorMetaByUserId.get(message.author.id);
+
+              return (
+                <Fragment key={message.id}>
+                  {showDateDivider && (
+                    <div className="message-date-divider">
+                      <span>{formatDateDivider(message.createdAt)}</span>
                     </div>
                   )}
-                </header>
+                  <TextChannelMessage
+                    message={message}
+                    grouped={grouped}
+                    inThread={Boolean(threadRoot)}
+                    threadCount={threadCounts[message.id] ?? 0}
+                    currentUserId={currentUserId}
+                    currentUsername={user?.username}
+                    currentDisplayName={user?.displayName}
+                    authorColor={authorMeta?.color}
+                    authorRoleName={authorMeta?.roleName}
+                    canManageMessages={canManageMessages}
+                    serverEmojis={serverEmojis}
+                    menuOpen={menuMessageId === message.id}
+                    reactionPickerOpen={reactionPickerMessageId === message.id}
+                    editing={editingId === message.id}
+                    editDraft={editDraft}
+                    onEditDraftChange={setEditDraft}
+                    onToggleMenu={() => {
+                      setReactionPickerMessageId(null);
+                      setMenuMessageId((current) => (current === message.id ? null : message.id));
+                    }}
+                    onToggleReactionPicker={() => {
+                      setMenuMessageId(null);
+                      setReactionPickerMessageId((current) =>
+                        current === message.id ? null : message.id,
+                      );
+                    }}
+                    onReply={() => {
+                      setReplyTo(message);
+                      closeMessageMenus();
+                    }}
+                    onOpenThread={() => openThread(message)}
+                    onReport={() => void handleReport(message)}
+                    onEdit={() => {
+                      setEditingId(message.id);
+                      setEditDraft(message.content);
+                      closeMessageMenus();
+                    }}
+                    onDelete={() => void handleDelete(message.id)}
+                    onTogglePin={() => void handleTogglePin(message)}
+                    onSaveEdit={() => void handleSaveEdit(message.id)}
+                    onCancelEdit={() => {
+                      setEditingId(null);
+                      setEditDraft("");
+                    }}
+                    onReaction={(emoji) => {
+                      void handleReaction(message, emoji);
+                      closeMessageMenus();
+                    }}
+                    onJumpToReply={scrollToMessage}
+                    onAuthorClick={(userId) => {
+                      const el = document.getElementById(`message-${message.id}`);
+                      const nameEl = el?.querySelector(".message-author-name");
+                      if (nameEl) {
+                        setProfileAnchor({ userId, rect: nameEl.getBoundingClientRect() });
+                      }
+                    }}
+                  />
+                </Fragment>
+              );
+            })}
+          </div>
 
-                {message.replyTo && (
-                  <div className="message-reply-preview">
-                    Replying to <strong>{message.replyTo.authorName}</strong>: {message.replyTo.content}
-                  </div>
-                )}
-
-                {isEditing ? (
-                  <div className="message-edit-form">
-                    <textarea
-                      value={editDraft}
-                      onChange={(event) => setEditDraft(event.target.value)}
-                      rows={3}
-                    />
-                    <div className="message-edit-actions">
-                      <button type="button" onClick={() => void handleSaveEdit(message.id)}>
-                        Save
-                      </button>
-                      <button
-                        type="button"
-                        className="channel-create-cancel"
-                        onClick={() => {
-                          setEditingId(null);
-                          setEditDraft("");
-                        }}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    {isDeleted ? (
-                      <p className="message-deleted-text">This message was deleted.</p>
-                    ) : (
-                      <>
-                        {message.content && (
-                          <div
-                            className="message-content"
-                            dangerouslySetInnerHTML={{
-                              __html: renderMessageContent(message.content),
-                            }}
-                          />
-                        )}
-                        {message.attachments.length > 0 && (
-                          <div className="message-attachments">
-                            {message.attachments.map((attachment) =>
-                              attachment.contentType.startsWith("image/") ? (
-                                <a key={attachment.id} href={attachment.url} target="_blank" rel="noreferrer">
-                                  <img src={attachment.url} alt={attachment.filename} />
-                                </a>
-                              ) : (
-                                <a key={attachment.id} href={attachment.url} target="_blank" rel="noreferrer">
-                                  📎 {attachment.filename}
-                                </a>
-                              ),
-                            )}
-                          </div>
-                        )}
-                      </>
-                    )}
-
-                    {!isDeleted && !isEditing && (
-                      <div className="message-footer">
-                        {message.reactions.length > 0 && (
-                          <div className="message-reactions">
-                            {message.reactions.map((reaction) => (
-                              <button
-                                key={reaction.emoji}
-                                type="button"
-                                className={`message-reaction${reaction.me ? " me" : ""}`}
-                                onClick={() => void handleReaction(message, reaction.emoji)}
-                              >
-                                {reaction.emoji} {reaction.count}
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                        <div className="message-reaction-picker-wrap">
-                          <button
-                            type="button"
-                            className="message-add-reaction"
-                            aria-label="Add reaction"
-                            aria-expanded={reactionPickerMessageId === message.id}
-                            onClick={() => {
-                              setMenuMessageId(null);
-                              setReactionPickerMessageId((current) =>
-                                current === message.id ? null : message.id,
-                              );
-                            }}
-                          >
-                            <AddReactionIcon />
-                          </button>
-                          {reactionPickerMessageId === message.id && (
-                            <div className="message-reaction-picker" role="menu">
-                              {QUICK_REACTIONS.map((emoji) => (
-                                <button
-                                  key={emoji}
-                                  type="button"
-                                  role="menuitem"
-                                  onClick={() => {
-                                    void handleReaction(message, emoji);
-                                    closeMessageMenus();
-                                  }}
-                                >
-                                  {emoji}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </>
-                )}
-              </article>
-            );
-          })}
+          {showJumpToPresent && (
+            <button type="button" className="jump-to-present" onClick={() => scrollToBottom()}>
+              <ArrowDownIcon />
+              Jump to present
+            </button>
+          )}
         </div>
 
-        {showPins && (
+        {showPins && !embedded && (
           <aside className="text-channel-pins">
-            <h3>Pinned Messages</h3>
+            <header className="text-channel-pins-header">
+              <PinIcon className="text-channel-pins-header-icon" />
+              <span>Pinned</span>
+            </header>
             {pins.length === 0 ? (
-              <p className="text-channel-meta">No pinned messages.</p>
+              <p className="text-channel-meta">No pinned messages yet.</p>
             ) : (
               pins.map((message) => (
                 <button
                   key={message.id}
                   type="button"
                   className="text-channel-pin-item"
-                  onClick={() => {
-                    const element = document.getElementById(`message-${message.id}`);
-                    element?.scrollIntoView({ behavior: "smooth", block: "center" });
-                  }}
+                  onClick={() => scrollToMessage(message.id)}
                 >
                   <strong>{message.author.displayName}</strong>
                   <span>{message.content || "Attachment"}</span>
@@ -724,91 +895,133 @@ export default function TextChannelPanel({
         )}
       </div>
 
-      {typingUsers.length > 0 && (
-        <p className="text-channel-typing">
-          {typingUsers.join(", ")} {typingUsers.length === 1 ? "is" : "are"} typing…
-        </p>
-      )}
+      <div className="text-channel-footer">
+        {typingUsers.length > 0 && (
+          <div className="text-channel-typing">
+            <span className="typing-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <span>
+              <strong>{typingUsers.join(", ")}</strong> {typingUsers.length === 1 ? "is" : "are"} typing
+            </span>
+          </div>
+        )}
 
-      {replyTo && (
-        <div className="text-channel-reply-bar">
-          Replying to <strong>{replyTo.author.displayName}</strong>
-          <button type="button" onClick={() => setReplyTo(null)}>
-            Cancel
-          </button>
-        </div>
-      )}
-
-      {canSend ? (
-        <div className="text-channel-composer">
-          {pendingUploads.length > 0 && (
-            <div className="text-channel-uploads">
-              {pendingUploads.map((upload) => (
-                <div key={upload.id} className="text-channel-upload-chip">
-                  {upload.previewUrl ? (
-                    <img src={upload.previewUrl} alt={upload.filename} />
-                  ) : (
-                    <span>{upload.filename}</span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setPendingUploads((current) => current.filter((item) => item.id !== upload.id))
-                    }
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
+        {replyTo && (
+          <div className="text-channel-reply-bar">
+            <ReplyIcon className="text-channel-reply-bar-icon" />
+            <div className="text-channel-reply-bar-text">
+              Replying to <strong>{replyTo.author.displayName}</strong>
+              <span>{replyTo.content}</span>
             </div>
-          )}
-
-          {mentionCandidates.length > 0 && (
-            <div className="mention-autocomplete">
-              {mentionCandidates.map((member) => (
-                <button key={member.userId} type="button" onClick={() => insertMention(member.username)}>
-                  @{member.username} <span>{member.displayName}</span>
-                </button>
-              ))}
-            </div>
-          )}
-
-          <div className="text-channel-composer-row">
-            {canAttach && (
-              <label className="text-channel-attach">
-                📎
-                <input
-                  type="file"
-                  multiple
-                  accept="image/jpeg,image/png,image/gif,image/webp,application/pdf,text/plain"
-                  onChange={(event) => void handleFileSelect(event.target.files)}
-                />
-              </label>
-            )}
-            <textarea
-              value={draft}
-              onChange={(event) => {
-                setDraft(event.target.value);
-                updateMentionState(event.target.value, event.target.selectionStart);
-                notifyTyping();
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void handleSend();
-                }
-              }}
-              placeholder={`Message #${threadRoot ? "thread" : channelName}`}
-              rows={1}
-            />
-            <button type="button" disabled={sending} onClick={() => void handleSend()}>
-              Send
+            <button type="button" className="text-channel-reply-bar-close" onClick={() => setReplyTo(null)} aria-label="Cancel reply">
+              ×
             </button>
           </div>
-          <p className="text-channel-hint">Shift+Enter for a new line. **bold**, *italic*, `code`, @mentions.</p>
-        </div>
-      ) : (
-        <p className="text-channel-readonly">You do not have permission to send messages in this channel.</p>
+        )}
+
+        {canSend && !threadLocked ? (
+          <div className="text-channel-composer-wrap">
+            <div className="text-channel-composer-card">
+              {pendingUploads.length > 0 && (
+                <div className="text-channel-uploads">
+                  {pendingUploads.map((upload) => (
+                    <div key={upload.id} className="text-channel-upload-chip">
+                      {upload.previewUrl ? (
+                        <img src={upload.previewUrl} alt={upload.filename} />
+                      ) : (
+                        <span>{upload.filename}</span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPendingUploads((current) => current.filter((item) => item.id !== upload.id))
+                        }
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {mentionCandidates.length > 0 && (
+                <div className="mention-autocomplete">
+                  {mentionCandidates.map((member) => (
+                    <button key={member.userId} type="button" onClick={() => insertMention(member.username)}>
+                      <span className="mention-autocomplete-user">@{member.username}</span>
+                      <span>{member.displayName}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="text-channel-composer-inner">
+                {canAttach && (
+                  <label className="text-channel-attach" title="Upload a file">
+                    <AttachIcon />
+                    <input
+                      type="file"
+                      multiple
+                      accept="image/jpeg,image/png,image/gif,image/webp,application/pdf,text/plain"
+                      onChange={(event) => void handleFileSelect(event.target.files)}
+                    />
+                  </label>
+                )}
+                <EmojiPicker
+                  emojis={serverEmojis}
+                  onSelect={insertEmoji}
+                  disabled={sending}
+                />
+                <textarea
+                  ref={composerRef}
+                  value={draft}
+                  onChange={(event) => {
+                    setDraft(event.target.value);
+                    updateMentionState(event.target.value, event.target.selectionStart);
+                    notifyTyping();
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void handleSend();
+                    }
+                  }}
+                  placeholder={`Message #${threadRoot ? "thread" : channelName}`}
+                  rows={1}
+                />
+                <button
+                  type="button"
+                  className="text-channel-send"
+                  disabled={sending || (!draft.trim() && pendingUploads.length === 0)}
+                  onClick={() => void handleSend()}
+                  title="Send message"
+                  aria-label="Send message"
+                >
+                  <SendIcon />
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : threadLocked ? (
+          <p className="text-channel-readonly">This thread is locked. You cannot send messages.</p>
+        ) : (
+          <p className="text-channel-readonly">You do not have permission to send messages in this channel.</p>
+        )}
+      </div>
+
+      {profileAnchor && (
+        <UserProfilePopover
+          userId={profileAnchor.userId}
+          serverId={serverId}
+          anchorRect={profileAnchor.rect}
+          onClose={() => setProfileAnchor(null)}
+          onMessage={
+            profileAnchor.userId === currentUserId ? undefined : onOpenDm
+          }
+        />
       )}
     </div>
   );

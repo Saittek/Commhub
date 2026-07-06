@@ -2,13 +2,15 @@ const INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const SERVER_NAME_PATTERN = /^[\w\s-]{2,32}$/;
 const VALID_REGIONS = new Set(["us-east", "us-west", "eu", "asia"]);
 const VALID_NOTIFICATIONS = new Set(["all", "mentions", "nothing"]);
+const VALID_UI_TEXT_SCALES = new Set([85, 100, 115, 130]);
 
 export interface CreateServerInput {
   name: string;
 }
 
 export interface JoinServerInput {
-  inviteCode: string;
+  inviteCode?: string;
+  serverId?: string;
 }
 
 export interface UpdateServerInput {
@@ -20,6 +22,8 @@ export interface UpdateServerInput {
   defaultNotifications?: string;
   explicitContentFilter?: boolean;
   afkTimeoutMinutes?: number;
+  uiTextScale?: number;
+  isPublic?: boolean;
 }
 
 export function validateCreateServer(input: CreateServerInput): string | null {
@@ -31,7 +35,11 @@ export function validateCreateServer(input: CreateServerInput): string | null {
 }
 
 export function validateJoinServer(input: JoinServerInput): string | null {
-  const inviteCode = input.inviteCode.trim();
+  if (input.serverId?.trim()) {
+    return null;
+  }
+
+  const inviteCode = (input.inviteCode ?? "").trim();
   if (inviteCode.length < 4) {
     return "Invite code is required.";
   }
@@ -43,7 +51,10 @@ export function normalizeCreateServer(input: CreateServerInput): CreateServerInp
 }
 
 export function normalizeJoinServer(input: JoinServerInput): JoinServerInput {
-  return { inviteCode: input.inviteCode.trim().toUpperCase() };
+  return {
+    inviteCode: input.inviteCode?.trim().toUpperCase(),
+    serverId: input.serverId?.trim(),
+  };
 }
 
 export function generateInviteCode(): string {
@@ -90,6 +101,13 @@ export function validateUpdateServer(input: UpdateServerInput): string | null {
       input.afkTimeoutMinutes > 60)
   ) {
     return "AFK timeout must be between 1 and 60 minutes.";
+  }
+
+  if (
+    input.uiTextScale !== undefined &&
+    (!Number.isInteger(input.uiTextScale) || !VALID_UI_TEXT_SCALES.has(input.uiTextScale))
+  ) {
+    return "Text size must be Compact, Default, Comfortable, or Large.";
   }
 
   return null;

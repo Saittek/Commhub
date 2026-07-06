@@ -7,6 +7,10 @@ import {
   speakingThreshold,
   type VoiceVideoPreferences,
 } from "./voice-video-settings";
+import {
+  applyAudioTrackConstraints,
+  VoiceAudioPipeline,
+} from "./voice-audio-pipeline";
 import { requestScreenCaptureStream, ScreenCaptureError } from "./screen-capture";
 
 export interface VoicePeer {
@@ -15,6 +19,8 @@ export interface VoicePeer {
   username: string;
   muted: boolean;
   deafened: boolean;
+  serverMuted: boolean;
+  serverDeafened: boolean;
   speaking: boolean;
   cameraEnabled: boolean;
   screenSharing: boolean;
@@ -44,6 +50,8 @@ interface VoiceClientOptions {
   onConnectionState: (state: VoiceConnectionState, error?: string) => void;
   onLocalMediaChange: (media: LocalVoiceMedia) => void;
   onRemoteMediaChange: (media: RemoteVoiceMedia[]) => void;
+  onLocalSpeakingChange?: (speaking: boolean) => void;
+  onMoved?: (channelId: string, channelName: string) => void;
 }
 
 interface RTCSignalData {
@@ -52,7 +60,7 @@ interface RTCSignalData {
   candidate?: RTCIceCandidateInit;
 }
 
-const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+import { buildIceServers } from "./voice-ice";
 
 function isScreenShareTrack(track: MediaStreamTrack): boolean {
   const settings = track.getSettings();
@@ -66,6 +74,8 @@ function defaultPeer(peer: Partial<VoicePeer> & Pick<VoicePeer, "userId" | "disp
     username: peer.username,
     muted: peer.muted ?? false,
     deafened: peer.deafened ?? false,
+    serverMuted: peer.serverMuted ?? false,
+    serverDeafened: peer.serverDeafened ?? false,
     speaking: peer.speaking ?? false,
     cameraEnabled: peer.cameraEnabled ?? false,
     screenSharing: peer.screenSharing ?? false,
@@ -80,9 +90,13 @@ export class VoiceClient {
   private readonly onConnectionState: (state: VoiceConnectionState, error?: string) => void;
   private readonly onLocalMediaChange: (media: LocalVoiceMedia) => void;
   private readonly onRemoteMediaChange: (media: RemoteVoiceMedia[]) => void;
+  private readonly onLocalSpeakingChange?: (speaking: boolean) => void;
+  private readonly onMoved?: (channelId: string, channelName: string) => void;
 
   private ws: WebSocket | null = null;
   private localStream: MediaStream | null = null;
+  private rawMicStream: MediaStream | null = null;
+  private readonly audioPipeline = new VoiceAudioPipeline();
   private cameraStream: MediaStream | null = null;
   private screenStream: MediaStream | null = null;
   private cameraEnabled = false;
@@ -91,6 +105,8 @@ export class VoiceClient {
   private peerConnections = new Map<string, RTCPeerConnection>();
   private remoteAudio = new Map<string, HTMLAudioElement>();
   private remoteMedia = new Map<string, { camera: MediaStream | null; screen: MediaStream | null }>();
+  private pendingMoveChannelId: string | null = null;
+  private pendingMoveChannelName = "";
   private muted = false;
   private deafened = false;
   private pttOnly = false;
@@ -111,9 +127,20 @@ export class VoiceClient {
   });
   private speakingSensitivity = 55;
   private speaking = false;
+  private vadActive = false;
+  private vadHoldUntil = 0;
+  private readonly vadHoldMs = 400;
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private speakingInterval: ReturnType<typeof setInterval> | null = null;
+  private connectOptions: {
+    channelPushToTalk: boolean;
+    voiceBitrate?: number;
+    settings: VoiceVideoPreferences;
+  } | null = null;
+  private intentionalDisconnect = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
 
   constructor(options: VoiceClientOptions) {
     this.serverId = options.serverId;
@@ -123,6 +150,8 @@ export class VoiceClient {
     this.onConnectionState = options.onConnectionState;
     this.onLocalMediaChange = options.onLocalMediaChange;
     this.onRemoteMediaChange = options.onRemoteMediaChange;
+    this.onLocalSpeakingChange = options.onLocalSpeakingChange;
+    this.onMoved = options.onMoved;
   }
 
   get localMedia(): LocalVoiceMedia {
@@ -148,6 +177,12 @@ export class VoiceClient {
     settings: VoiceVideoPreferences;
   }): Promise<void> {
     const { settings } = options;
+    this.connectOptions = options;
+    this.intentionalDisconnect = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.pttOnly = options.channelPushToTalk || settings.pushToTalk;
     this.channelPushToTalk = options.channelPushToTalk;
     this.voiceBitrate = options.voiceBitrate ?? 64000;
@@ -156,13 +191,16 @@ export class VoiceClient {
     this.cameraDeviceId = settings.cameraDeviceId;
     this.processing = effectiveProcessing(settings);
     this.speakingSensitivity = effectiveSensitivity(settings);
+    this.vadActive = false;
+    this.vadHoldUntil = 0;
     this.onConnectionState("connecting");
 
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
+      this.rawMicStream = await navigator.mediaDevices.getUserMedia({
         audio: buildAudioConstraints(this.inputDeviceId, this.processing),
         video: false,
       });
+      this.localStream = this.audioPipeline.process(this.rawMicStream, settings);
       this.applyMicTrackState();
       this.setupSpeakingDetection();
       this.emitLocalMedia();
@@ -172,6 +210,7 @@ export class VoiceClient {
       this.ws = new WebSocket(wsUrl);
 
       this.ws.onopen = () => {
+        this.reconnectAttempts = 0;
         this.onConnectionState("connected");
       };
 
@@ -179,8 +218,27 @@ export class VoiceClient {
         this.handleSocketMessage(String(event.data));
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (event) => {
+        const moved = event.code === 4000;
+        const options = this.connectOptions;
+        const intentional = this.intentionalDisconnect;
         this.cleanup(false);
+        if (moved && this.onMoved && this.pendingMoveChannelId) {
+          this.onMoved(this.pendingMoveChannelId, this.pendingMoveChannelName);
+          this.pendingMoveChannelId = null;
+          this.pendingMoveChannelName = "";
+          return;
+        }
+        if (!intentional && options && this.reconnectAttempts < 5) {
+          this.reconnectAttempts += 1;
+          this.onConnectionState("connecting");
+          const delay = Math.min(1200 * this.reconnectAttempts, 8000);
+          this.reconnectTimer = setTimeout(() => {
+            void this.connect(options);
+          }, delay);
+          return;
+        }
+        this.connectOptions = null;
         this.onConnectionState("disconnected");
       };
 
@@ -196,6 +254,12 @@ export class VoiceClient {
   }
 
   disconnect(): void {
+    this.intentionalDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.connectOptions = null;
     this.sendStateUpdate({
       muted: false,
       deafened: false,
@@ -206,6 +270,20 @@ export class VoiceClient {
     this.ws?.close();
     this.cleanup(true);
     this.onConnectionState("disconnected");
+  }
+
+  async retryConnect(): Promise<void> {
+    if (!this.connectOptions) {
+      return;
+    }
+    this.intentionalDisconnect = false;
+    this.reconnectAttempts = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.cleanup(false);
+    await this.connect(this.connectOptions);
   }
 
   async toggleCamera(): Promise<string | null> {
@@ -329,39 +407,55 @@ export class VoiceClient {
   }
 
   async updateVoiceVideoSettings(settings: VoiceVideoPreferences): Promise<void> {
+    const previousDeviceId = this.inputDeviceId;
     this.inputDeviceId = settings.inputDeviceId;
     this.outputDeviceId = settings.outputDeviceId;
     this.cameraDeviceId = settings.cameraDeviceId;
     this.processing = effectiveProcessing(settings);
     this.speakingSensitivity = effectiveSensitivity(settings);
     this.pttOnly = this.channelPushToTalk || settings.pushToTalk;
+    this.vadActive = false;
+    this.vadHoldUntil = 0;
 
     for (const audio of this.remoteAudio.values()) {
       await applyOutputDevice(audio, this.outputDeviceId);
     }
 
-    if (!this.localStream) {
+    if (!this.rawMicStream) {
       return;
     }
 
-    const newStream = await navigator.mediaDevices.getUserMedia({
-      audio: buildAudioConstraints(this.inputDeviceId, this.processing),
-      video: false,
-    });
-    const newTrack = newStream.getAudioTracks()[0];
+    const deviceChanged = previousDeviceId !== settings.inputDeviceId;
 
-    for (const track of this.localStream.getAudioTracks()) {
-      track.stop();
+    if (deviceChanged) {
+      this.audioPipeline.stop(false);
+      for (const track of this.rawMicStream.getTracks()) {
+        track.stop();
+      }
+      this.rawMicStream = await navigator.mediaDevices.getUserMedia({
+        audio: buildAudioConstraints(this.inputDeviceId, this.processing),
+        video: false,
+      });
+    } else {
+      const rawTrack = this.rawMicStream.getAudioTracks()[0];
+      if (rawTrack) {
+        await applyAudioTrackConstraints(rawTrack, this.processing);
+      }
+      this.audioPipeline.stop(false);
     }
 
-    for (const pc of this.peerConnections.values()) {
-      const sender = pc.getSenders().find((item) => item.track?.kind === "audio");
-      if (sender) {
-        await sender.replaceTrack(newTrack);
+    this.localStream = this.audioPipeline.process(this.rawMicStream, settings);
+    const newTrack = this.localStream.getAudioTracks()[0];
+
+    if (newTrack) {
+      for (const pc of this.peerConnections.values()) {
+        const sender = pc.getSenders().find((item) => item.track?.kind === "audio");
+        if (sender) {
+          await sender.replaceTrack(newTrack);
+        }
       }
     }
 
-    this.localStream = newStream;
     this.teardownSpeakingDetection();
     this.applyMicTrackState();
     this.setupSpeakingDetection();
@@ -383,9 +477,14 @@ export class VoiceClient {
       data?: RTCSignalData;
       muted?: boolean;
       deafened?: boolean;
+      serverMuted?: boolean;
+      serverDeafened?: boolean;
       speaking?: boolean;
       cameraEnabled?: boolean;
       screenSharing?: boolean;
+      channelId?: string;
+      targetChannelId?: string;
+      channelName?: string;
     };
 
     try {
@@ -426,6 +525,8 @@ export class VoiceClient {
           if (peer) {
             peer.muted = message.muted ?? peer.muted;
             peer.deafened = message.deafened ?? peer.deafened;
+            peer.serverMuted = message.serverMuted ?? peer.serverMuted;
+            peer.serverDeafened = message.serverDeafened ?? peer.serverDeafened;
             peer.speaking = message.speaking ?? peer.speaking;
             peer.cameraEnabled = message.cameraEnabled ?? peer.cameraEnabled;
             peer.screenSharing = message.screenSharing ?? peer.screenSharing;
@@ -437,6 +538,10 @@ export class VoiceClient {
         if (message.fromUserId && message.data) {
           void this.handleSignal(message.fromUserId, message.data);
         }
+        break;
+      case "moved":
+        this.pendingMoveChannelId = message.channelId ?? message.targetChannelId ?? null;
+        this.pendingMoveChannelName = message.channelName ?? "Voice";
         break;
       default:
         break;
@@ -453,7 +558,7 @@ export class VoiceClient {
       return existing;
     }
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
 
     for (const { track, stream } of this.getPublishedTracks()) {
       pc.addTrack(track, stream);
@@ -774,7 +879,10 @@ export class VoiceClient {
       return;
     }
 
-    const enabled = !this.muted && (!this.pttOnly || this.pttActive);
+    const enabled =
+      !this.muted &&
+      (this.pttOnly ? this.pttActive : this.vadActive);
+
     for (const track of this.localStream.getAudioTracks()) {
       track.enabled = enabled;
     }
@@ -817,19 +925,44 @@ export class VoiceClient {
         if (this.speaking) {
           this.speaking = false;
           this.sendStateUpdate({ speaking: false });
+          this.onLocalSpeakingChange?.(false);
+        }
+        if (!this.pttOnly && this.vadActive) {
+          this.vadActive = false;
+          this.applyMicTrackState();
         }
         return;
       }
 
       this.analyser.getByteFrequencyData(buffer);
       const average = buffer.reduce((sum, value) => sum + value, 0) / buffer.length;
-      const nextSpeaking =
-        average > speakingThreshold(this.speakingSensitivity) &&
-        (!this.pttOnly || this.pttActive);
+      const openThreshold = speakingThreshold(this.speakingSensitivity);
+      const closeThreshold = openThreshold * 0.7;
+      const now = Date.now();
+
+      if (!this.pttOnly) {
+        let voiceDetected = this.vadActive;
+        if (average > openThreshold) {
+          voiceDetected = true;
+          this.vadHoldUntil = now + this.vadHoldMs;
+        } else if (average < closeThreshold && now > this.vadHoldUntil) {
+          voiceDetected = false;
+        }
+
+        if (voiceDetected !== this.vadActive) {
+          this.vadActive = voiceDetected;
+          this.applyMicTrackState();
+        }
+      }
+
+      const nextSpeaking = this.pttOnly
+        ? this.pttActive
+        : this.vadActive;
 
       if (nextSpeaking !== this.speaking) {
         this.speaking = nextSpeaking;
         this.sendStateUpdate({ speaking: nextSpeaking });
+        this.onLocalSpeakingChange?.(nextSpeaking);
       }
     }, 120);
   }
@@ -853,10 +986,14 @@ export class VoiceClient {
     this.remoteAudio.clear();
 
     if (this.localStream) {
-      for (const track of this.localStream.getTracks()) {
-        track.stop();
-      }
       this.localStream = null;
+    }
+
+    if (this.rawMicStream) {
+      this.audioPipeline.stop(true);
+      this.rawMicStream = null;
+    } else {
+      this.audioPipeline.stop(false);
     }
 
     if (this.cameraStream) {

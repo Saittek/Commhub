@@ -19,6 +19,14 @@ export interface MessageReaction {
   userIds: string[];
 }
 
+export interface MessageEmbed {
+  url: string;
+  title: string | null;
+  description: string | null;
+  imageUrl: string | null;
+  siteName: string | null;
+}
+
 export interface Message {
   id: string;
   channelId: string;
@@ -38,6 +46,9 @@ export interface Message {
   pinned: boolean;
   attachments: MessageAttachment[];
   reactions: MessageReaction[];
+  embeds: MessageEmbed[];
+  threadArchived: boolean;
+  threadLocked: boolean;
 }
 
 export type TextSocketEvent =

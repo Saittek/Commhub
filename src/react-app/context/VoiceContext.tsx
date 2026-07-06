@@ -19,6 +19,11 @@ import {
   type VoiceConnectionState,
   type VoicePeer,
 } from "../lib/voice-client";
+import {
+  playVoiceConnectSound,
+  playVoiceDisconnectSound,
+  playVoiceErrorSound,
+} from "../lib/voice-sounds";
 import { useAuth } from "./AuthContext";
 
 export interface JoinedVoiceChannel {
@@ -37,6 +42,7 @@ interface VoiceContextValue {
   deafened: boolean;
   localMedia: LocalVoiceMedia;
   remoteMedia: RemoteVoiceMedia[];
+  localSpeaking: boolean;
   isJoined: boolean;
   join: (server: { id: string; name: string }, channel: Channel) => Promise<void>;
   disconnect: () => void;
@@ -47,6 +53,7 @@ interface VoiceContextValue {
   setPushToTalk: (active: boolean) => void;
   clearError: () => void;
   updateVoiceVideoSettings: (prefs: VoiceVideoPreferences) => Promise<void>;
+  retryVoiceConnection: () => Promise<void>;
 }
 
 const EMPTY_LOCAL_MEDIA: LocalVoiceMedia = {
@@ -61,6 +68,9 @@ const VoiceContext = createContext<VoiceContextValue | null>(null);
 export function VoiceProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const clientRef = useRef<VoiceClient | null>(null);
+  const joinRef = useRef<(server: { id: string; name: string }, channel: Channel) => Promise<void>>(
+    async () => {},
+  );
   const channelPushToTalkRef = useRef(false);
   const mutedRef = useRef(false);
   const deafenedRef = useRef(false);
@@ -72,6 +82,8 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
   const [deafened, setDeafened] = useState(false);
   const [localMedia, setLocalMedia] = useState<LocalVoiceMedia>(EMPTY_LOCAL_MEDIA);
   const [remoteMedia, setRemoteMedia] = useState<RemoteVoiceMedia[]>([]);
+  const [localSpeaking, setLocalSpeaking] = useState(false);
+  const prevConnectionStateRef = useRef<VoiceConnectionState>("disconnected");
 
   mutedRef.current = muted;
   deafenedRef.current = deafened;
@@ -96,6 +108,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     setConnectionState("disconnected");
     setLocalMedia(EMPTY_LOCAL_MEDIA);
     setRemoteMedia([]);
+    setLocalSpeaking(false);
   }, []);
 
   useEffect(() => {
@@ -113,6 +126,20 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  useEffect(() => {
+    const prev = prevConnectionStateRef.current;
+    if (connectionState === "connected" && prev !== "connected") {
+      playVoiceConnectSound();
+    }
+    if (connectionState === "disconnected" && (prev === "connected" || prev === "connecting")) {
+      playVoiceDisconnectSound();
+    }
+    if (connectionState === "error" && prev !== "error") {
+      playVoiceErrorSound();
+    }
+    prevConnectionStateRef.current = connectionState;
+  }, [connectionState]);
+
   const join = useCallback(
     async (server: { id: string; name: string }, channel: Channel) => {
       if (!user || channel.type !== "voice") {
@@ -120,18 +147,15 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
       }
 
       if (joined && joined.channelId !== channel.id) {
-        setError(
-          `You are connected to ${joined.channelName}. Disconnect before joining another voice channel.`,
-        );
-        return;
-      }
-
-      if (joined?.channelId === channel.id && connectionState !== "disconnected") {
-        return;
-      }
-
-      if (clientRef.current) {
         disconnect();
+      }
+
+      if (clientRef.current && joined?.channelId === channel.id) {
+        return;
+      }
+
+      if (joined?.channelId === channel.id && connectionState === "connected") {
+        return;
       }
 
       setError(null);
@@ -146,8 +170,16 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         serverId: server.id,
         channelId: channel.id,
         localUserId: user.id,
-        onPeersChange: setPeers,
+        onPeersChange: (nextPeers) => {
+          if (clientRef.current !== client) {
+            return;
+          }
+          setPeers(nextPeers);
+        },
         onConnectionState: (state, message) => {
+          if (clientRef.current !== client) {
+            return;
+          }
           setConnectionState(state);
           setError(state === "error" ? (message ?? "Voice connection failed.") : null);
           if (state === "disconnected" || state === "error") {
@@ -155,11 +187,40 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
             setPeers([]);
             setLocalMedia(EMPTY_LOCAL_MEDIA);
             setRemoteMedia([]);
+            setLocalSpeaking(false);
             clientRef.current = null;
           }
         },
-        onLocalMediaChange: setLocalMedia,
-        onRemoteMediaChange: setRemoteMedia,
+        onLocalMediaChange: (media) => {
+          if (clientRef.current !== client) {
+            return;
+          }
+          setLocalMedia(media);
+        },
+        onRemoteMediaChange: (media) => {
+          if (clientRef.current !== client) {
+            return;
+          }
+          setRemoteMedia(media);
+        },
+        onLocalSpeakingChange: (speaking) => {
+          if (clientRef.current !== client) {
+            return;
+          }
+          setLocalSpeaking(speaking);
+        },
+        onMoved: (targetChannelId, targetChannelName) => {
+          void joinRef.current(server, {
+            id: targetChannelId,
+            serverId: server.id,
+            name: targetChannelName,
+            type: channel.type,
+            createdAt: channel.createdAt,
+            voiceBitrate: channel.voiceBitrate,
+            voiceUserLimit: channel.voiceUserLimit,
+            voicePttOnly: channel.voicePttOnly,
+          });
+        },
       });
 
       clientRef.current = client;
@@ -174,6 +235,8 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     },
     [user, joined, connectionState, disconnect, applyAudioStateToClient],
   );
+
+  joinRef.current = join;
 
   const toggleMute = useCallback(() => {
     const wasDeafened = deafenedRef.current;
@@ -253,6 +316,12 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const retryVoiceConnection = useCallback(async () => {
+    if (clientRef.current) {
+      await clientRef.current.retryConnect();
+    }
+  }, []);
+
   const isJoined = joined !== null && connectionState === "connected";
 
   const value: VoiceContextValue = {
@@ -264,6 +333,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     deafened,
     localMedia,
     remoteMedia,
+    localSpeaking,
     isJoined,
     join,
     disconnect,
@@ -274,6 +344,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     setPushToTalk,
     clearError,
     updateVoiceVideoSettings,
+    retryVoiceConnection,
   };
 
   return <VoiceContext.Provider value={value}>{children}</VoiceContext.Provider>;

@@ -131,3 +131,41 @@ export function normalizeChangePassword(input: ChangePasswordInput): ChangePassw
     newPassword: input.newPassword,
   };
 }
+
+export interface ForgotPasswordInput {
+  email: string;
+}
+
+export interface ResetPasswordInput {
+  token: string;
+  password: string;
+}
+
+export function validateForgotPassword(input: ForgotPasswordInput): string | null {
+  const email = input.email.trim().toLowerCase();
+  if (!EMAIL_PATTERN.test(email)) {
+    return "Please enter a valid email address.";
+  }
+  return null;
+}
+
+export function normalizeForgotPassword(input: ForgotPasswordInput): ForgotPasswordInput {
+  return { email: input.email.trim().toLowerCase() };
+}
+
+export function validateResetPassword(input: ResetPasswordInput): string | null {
+  if (!input.token.trim()) {
+    return "Reset link is invalid or expired.";
+  }
+  if (input.password.length < 8) {
+    return "Password must be at least 8 characters.";
+  }
+  return null;
+}
+
+export function normalizeResetPassword(input: ResetPasswordInput): ResetPasswordInput {
+  return {
+    token: input.token.trim(),
+    password: input.password,
+  };
+}

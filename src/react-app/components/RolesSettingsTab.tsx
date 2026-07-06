@@ -18,7 +18,7 @@ interface RolesSettingsTabProps {
 
 const ROLE_COLORS = [
   "#99aab5",
-  "#5865f2",
+  "#14b8a6",
   "#57f287",
   "#fee75c",
   "#ed4245",
@@ -41,7 +41,7 @@ export default function RolesSettingsTab({
   const [canManage, setCanManage] = useState(false);
   const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
   const [name, setName] = useState("");
-  const [color, setColor] = useState("#5865f2");
+  const [color, setColor] = useState("#14b8a6");
   const [permissions, setPermissions] = useState<RolePermissions>(emptyPermissions);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -126,6 +126,27 @@ export default function RolesSettingsTab({
     });
   }
 
+  async function handleMoveRole(roleId: string, direction: "up" | "down") {
+    const index = roles.findIndex((r) => r.id === roleId);
+    if (index < 0) return;
+    const swapIndex = direction === "up" ? index - 1 : index + 1;
+    if (swapIndex < 0 || swapIndex >= roles.length) return;
+    const role = roles[index];
+    const swapRole = roles[swapIndex];
+    if (role.isEveryone || role.isManaged || swapRole.isEveryone || swapRole.isManaged) return;
+
+    setSaving(true);
+    try {
+      await updateRole(serverId, role.id, { position: swapRole.position });
+      await updateRole(serverId, swapRole.id, { position: role.position });
+      await loadRoles(role.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reorder roles.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function handleCreateRole() {
     if (!canManage) {
       return;
@@ -138,7 +159,7 @@ export default function RolesSettingsTab({
     try {
       const response = await createRole(serverId, {
         name: "New Role",
-        color: "#5865f2",
+        color: "#14b8a6",
         permissions: {},
       });
       await loadRoles(response.role.id);
@@ -261,17 +282,24 @@ export default function RolesSettingsTab({
 
       <div className="roles-layout">
         <div className="roles-list">
-          {roles.map((role) => (
-            <button
-              key={role.id}
-              type="button"
-              className={selectedRoleId === role.id ? "role-list-item active" : "role-list-item"}
-              onClick={() => selectRole(role)}
-            >
-              <span className="role-color-dot" style={{ backgroundColor: role.color }} />
-              <span className="role-list-name">{role.name}</span>
-              <span className="role-list-count">{role.memberCount}</span>
-            </button>
+          {roles.map((role, index) => (
+            <div key={role.id} className="role-list-item-wrap">
+              <button
+                type="button"
+                className={selectedRoleId === role.id ? "role-list-item active" : "role-list-item"}
+                onClick={() => selectRole(role)}
+              >
+                <span className="role-color-dot" style={{ backgroundColor: role.color }} />
+                <span className="role-list-name">{role.name}</span>
+                <span className="role-list-count">{role.memberCount}</span>
+              </button>
+              {canManage && !role.isEveryone && !role.isManaged && (
+                <div className="role-reorder-btns">
+                  <button type="button" disabled={index === 0 || saving} onClick={() => void handleMoveRole(role.id, "up")}>↑</button>
+                  <button type="button" disabled={index === roles.length - 1 || saving} onClick={() => void handleMoveRole(role.id, "down")}>↓</button>
+                </div>
+              )}
+            </div>
           ))}
         </div>
 
@@ -355,7 +383,7 @@ export default function RolesSettingsTab({
                   membersWithRole.map((member) => (
                     <div key={member.userId} className="role-member-row">
                       <span>
-                        {member.displayName}
+                        {member.nickname || member.displayName}
                         <small>@{member.username}</small>
                       </span>
                       {canManage && !selectedRole.isEveryone && !(selectedRole.isManaged && member.isOwner) && (
