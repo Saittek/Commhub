@@ -41,7 +41,9 @@ function VoiceChannelIcon() {
 }
 
 function ChannelIcon({ type }: { type: ChannelType }) {
-  if (type === "text") return <TextChannelIcon />;
+  if (type === "text" || type === "announcement") return <TextChannelIcon />;
+  if (type === "forum") return <span className="channel-prefix">◆</span>;
+  if (type === "stage") return <span className="channel-prefix">🎙</span>;
   return <VoiceChannelIcon />;
 }
 
@@ -79,7 +81,7 @@ function ChannelRow({
   onDrop,
 }: ChannelRowProps) {
   const showUnread =
-    channel.type === "text" &&
+    (channel.type === "text" || channel.type === "announcement") &&
     (unreadCounts[channel.id] ?? 0) > 0 &&
     activeChannelId !== channel.id;
 
@@ -112,6 +114,9 @@ function ChannelRow({
         {showUnread && <span className="channel-unread-badge">{unreadCounts[channel.id]}</span>}
         {channel.type === "voice" && connectedVoiceChannelId === channel.id && (
             <span className="channel-connected-badge">Live</span>
+          )}
+        {channel.type === "stage" && connectedVoiceChannelId === channel.id && (
+            <span className="channel-connected-badge">Stage</span>
           )}
       </button>
       {canManage && (
@@ -301,7 +306,10 @@ export default function ChannelList({
 
   const uncategorized = sortChannels(channels.filter((c) => !c.categoryId));
   const textChannels = uncategorized.filter((channel) => channel.type === "text");
+  const announcementChannels = uncategorized.filter((channel) => channel.type === "announcement");
+  const forumChannels = uncategorized.filter((channel) => channel.type === "forum");
   const voiceChannels = uncategorized.filter((channel) => channel.type === "voice");
+  const stageChannels = uncategorized.filter((channel) => channel.type === "stage");
 
   const dragHandlers = {
     draggingChannelId,
@@ -400,9 +408,51 @@ export default function ChannelList({
           onEditChannel={setEditingChannelId}
         />
         <ChannelSection
+          title="Announcement"
+          type="announcement"
+          channels={announcementChannels}
+          activeChannelId={activeChannelId}
+          connectedVoiceChannelId={connectedVoiceChannelId}
+          unreadCounts={unreadCounts}
+          editingChannelId={editingChannelId}
+          canManage={canManage}
+          {...dragHandlers}
+          onOpenCreate={setCreatingChannelType}
+          onSelectChannel={onSelectChannel}
+          onEditChannel={setEditingChannelId}
+        />
+        <ChannelSection
+          title="Forum"
+          type="forum"
+          channels={forumChannels}
+          activeChannelId={activeChannelId}
+          connectedVoiceChannelId={connectedVoiceChannelId}
+          unreadCounts={unreadCounts}
+          editingChannelId={editingChannelId}
+          canManage={canManage}
+          {...dragHandlers}
+          onOpenCreate={setCreatingChannelType}
+          onSelectChannel={onSelectChannel}
+          onEditChannel={setEditingChannelId}
+        />
+        <ChannelSection
           title="Voice channels"
           type="voice"
           channels={voiceChannels}
+          activeChannelId={activeChannelId}
+          connectedVoiceChannelId={connectedVoiceChannelId}
+          unreadCounts={unreadCounts}
+          editingChannelId={editingChannelId}
+          canManage={canManage}
+          {...dragHandlers}
+          onOpenCreate={setCreatingChannelType}
+          onSelectChannel={onSelectChannel}
+          onEditChannel={setEditingChannelId}
+        />
+        <ChannelSection
+          title="Stage channels"
+          type="stage"
+          channels={stageChannels}
           activeChannelId={activeChannelId}
           connectedVoiceChannelId={connectedVoiceChannelId}
           unreadCounts={unreadCounts}

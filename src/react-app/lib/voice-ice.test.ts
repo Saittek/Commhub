@@ -6,10 +6,10 @@ describe("buildIceServers", () => {
     vi.unstubAllEnvs();
   });
 
-  it("includes default STUN", () => {
+  it("includes default STUN servers", () => {
     vi.stubEnv("VITE_TURN_URL", "");
     const servers = buildIceServers();
-    expect(servers).toHaveLength(1);
+    expect(servers.length).toBeGreaterThanOrEqual(3);
     expect(servers[0].urls).toBe("stun:stun.l.google.com:19302");
   });
 
@@ -18,8 +18,8 @@ describe("buildIceServers", () => {
     vi.stubEnv("VITE_TURN_USERNAME", "user");
     vi.stubEnv("VITE_TURN_CREDENTIAL", "pass");
     const servers = buildIceServers();
-    expect(servers).toHaveLength(2);
-    expect(servers[1]).toMatchObject({
+    expect(servers).toHaveLength(4);
+    expect(servers[3]).toMatchObject({
       urls: "turn:turn.example.com:3478",
       username: "user",
       credential: "pass",

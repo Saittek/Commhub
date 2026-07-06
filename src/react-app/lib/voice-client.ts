@@ -52,6 +52,7 @@ interface VoiceClientOptions {
   onRemoteMediaChange: (media: RemoteVoiceMedia[]) => void;
   onLocalSpeakingChange?: (speaking: boolean) => void;
   onMoved?: (channelId: string, channelName: string) => void;
+  onRemoteSound?: (soundUrl: string, soundName: string, displayName: string) => void;
 }
 
 interface RTCSignalData {
@@ -141,6 +142,7 @@ export class VoiceClient {
   private intentionalDisconnect = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+  private onRemoteSound?: (soundUrl: string, soundName: string, displayName: string) => void;
 
   constructor(options: VoiceClientOptions) {
     this.serverId = options.serverId;
@@ -152,6 +154,23 @@ export class VoiceClient {
     this.onRemoteMediaChange = options.onRemoteMediaChange;
     this.onLocalSpeakingChange = options.onLocalSpeakingChange;
     this.onMoved = options.onMoved;
+    this.onRemoteSound = options.onRemoteSound;
+  }
+
+  playSoundboard(sound: { id: string; url: string; name: string }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: "play-sound",
+        soundId: sound.id,
+        soundUrl: sound.url,
+        soundName: sound.name,
+      }),
+    );
+    const audio = new Audio(sound.url);
+    void audio.play().catch(() => undefined);
   }
 
   get localMedia(): LocalVoiceMedia {
@@ -485,6 +504,9 @@ export class VoiceClient {
       channelId?: string;
       targetChannelId?: string;
       channelName?: string;
+      soundUrl?: string;
+      soundName?: string;
+      displayName?: string;
     };
 
     try {
@@ -542,6 +564,19 @@ export class VoiceClient {
       case "moved":
         this.pendingMoveChannelId = message.channelId ?? message.targetChannelId ?? null;
         this.pendingMoveChannelName = message.channelName ?? "Voice";
+        break;
+      case "sound-played":
+        if (message.soundUrl && message.soundName) {
+          this.onRemoteSound?.(
+            String(message.soundUrl),
+            String(message.soundName),
+            String(message.displayName ?? "Someone"),
+          );
+          if (message.userId !== this.localUserId) {
+            const audio = new Audio(String(message.soundUrl));
+            void audio.play().catch(() => undefined);
+          }
+        }
         break;
       default:
         break;

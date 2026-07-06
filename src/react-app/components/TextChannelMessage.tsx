@@ -314,6 +314,11 @@ export default function TextChannelMessage({
                     ))}
                   </div>
                 )}
+                {message.sticker && (
+                  <div className="message-sticker">
+                    <img src={message.sticker.url} alt={message.sticker.name} />
+                  </div>
+                )}
                 {message.attachments.length > 0 && (
                   <div className="message-attachments">
                     {message.attachments.map((attachment) =>

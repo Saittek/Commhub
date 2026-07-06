@@ -25,6 +25,7 @@ import {
 } from "../lib/api";
 import { formatDateDivider, isDifferentDay } from "../lib/message-format";
 import { dmToMessage, shouldGroupWithPrevious } from "../lib/message-utils";
+import { DmChannelClient } from "../lib/dm-client";
 import TextChannelMessage from "./TextChannelMessage";
 import VoiceInviteMessage from "./VoiceInviteMessage";
 import UserAvatar from "./UserAvatar";
@@ -112,37 +113,48 @@ export default function FriendsDmPanel({
       return;
     }
 
-    async function loadMessages() {
+    let cancelled = false;
+
+    async function loadInitial() {
       try {
         const response = await getDmMessages(activeDmId!);
-        const next = response.messages;
-
-        for (const msg of next) {
-          if (
-            !knownMessageIdsRef.current.has(msg.id) &&
-            msg.author.id !== user?.id &&
-            knownMessageIdsRef.current.size > 0
-          ) {
-            pushNotification({
-              title: isVoiceInviteMessage(msg.content) ? "Voice invite" : msg.author.displayName,
-              body: isVoiceInviteMessage(msg.content)
-                ? stripVoiceInviteMarker(msg.content).slice(0, 120)
-                : msg.content.slice(0, 120) || "Attachment",
-              type: isVoiceInviteMessage(msg.content) ? "voice-invite" : "dm",
-            });
-          }
-        }
-
-        knownMessageIdsRef.current = new Set(next.map((msg) => msg.id));
-        setMessages(next);
+        if (cancelled) return;
+        knownMessageIdsRef.current = new Set(response.messages.map((msg) => msg.id));
+        setMessages(response.messages);
       } catch {
-        // ignore polling errors
+        // ignore
       }
     }
 
-    void loadMessages();
-    const timer = window.setInterval(() => void loadMessages(), 3000);
-    return () => window.clearInterval(timer);
+    void loadInitial();
+
+    const client = new DmChannelClient(activeDmId, (event) => {
+      if (event.type !== "message-create") {
+        return;
+      }
+      const msg = event.message;
+      if (knownMessageIdsRef.current.has(msg.id)) {
+        return;
+      }
+      knownMessageIdsRef.current.add(msg.id);
+      if (msg.author.id !== user?.id) {
+        pushNotification({
+          title: isVoiceInviteMessage(msg.content) ? "Voice invite" : msg.author.displayName,
+          body: isVoiceInviteMessage(msg.content)
+            ? stripVoiceInviteMarker(msg.content).slice(0, 120)
+            : msg.content.slice(0, 120) || "Attachment",
+          type: isVoiceInviteMessage(msg.content) ? "voice-invite" : "dm",
+        });
+      }
+      setMessages((current) => [...current, msg]);
+    });
+
+    client.connect();
+
+    return () => {
+      cancelled = true;
+      client.disconnect();
+    };
   }, [activeDmId, user?.id, pushNotification]);
 
   useEffect(() => {

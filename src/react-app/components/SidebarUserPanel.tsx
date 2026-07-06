@@ -1,7 +1,15 @@
 import { useEffect, useState, type ReactNode } from "react";
-import type { User } from "../lib/api";
-import { getMyPresence, getServerSounds, startActivity, updateMyPresence, updateMyActivity, type PresenceStatus, type ServerSound } from "../lib/api";
+import {
+  getMyPresence,
+  getServerSounds,
+  startActivity,
+  updateMyActivity,
+  updateMyPresence,
+  type PresenceStatus,
+  type ServerSound,
+} from "../lib/api";
 import { useVoice } from "../context/VoiceContext";
+import type { User } from "../lib/api";
 import type { JoinedVoiceChannel } from "../context/VoiceContext";
 import UserAvatar from "./UserAvatar";
 import { GearIcon, JoinServerIcon, LogOutIcon, FriendsIcon } from "./UiIcons";
@@ -216,8 +224,7 @@ export default function SidebarUserPanel({
   }, [serverId, voiceConnection?.channelId]);
 
   function playSound(sound: ServerSound) {
-    const audio = new Audio(sound.url);
-    void audio.play().catch(() => undefined);
+    voice.playSoundboard(sound);
   }
 
   async function handleStatusChange(next: PresenceStatus) {

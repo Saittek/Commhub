@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import { requireUser } from "./lib/session";
 import { requireServerMember } from "./lib/server-access";
 import { memberHasPermission } from "./lib/user-permissions";
+import { getServerBoostPerks } from "./lib/boost-limits";
 
 function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
@@ -112,6 +113,16 @@ export function registerPlatformRoutes(app: Hono<{ Bindings: Env }>) {
     }
     if (!SOUND_TYPES.has(file.type) || file.size > MAX_SOUND_BYTES) {
       return jsonError("Sound must be audio under 512KB.", 400);
+    }
+
+    const perks = await getServerBoostPerks(c.env.DB, server.id);
+    const soundCount = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM server_sounds WHERE server_id = ?",
+    )
+      .bind(server.id)
+      .first<{ count: number }>();
+    if ((soundCount?.count ?? 0) >= perks.soundboardSlots) {
+      return jsonError(`Soundboard is full (${perks.soundboardSlots} slots at boost level ${perks.boostLevel}).`, 400);
     }
 
     const soundId = newId();

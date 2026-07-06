@@ -15,6 +15,8 @@ interface ServerRow {
   default_notifications: string;
   explicit_content_filter: number;
   afk_timeout_minutes: number;
+  afk_channel_id?: string | null;
+  vanity_url?: string | null;
   ui_text_scale?: number;
   is_public?: number;
   created_at: string;
@@ -28,9 +30,13 @@ function isMissingColumnError(error: unknown, column: string): boolean {
 
 const SERVER_SELECT_COLUMNS = `id, name, invite_code, owner_id, description, region, invites_paused,
               verification_level, default_notifications, explicit_content_filter,
-              afk_timeout_minutes, created_at, icon_url`;
+              afk_timeout_minutes, afk_channel_id, vanity_url, created_at, icon_url`;
 
 const SERVER_SELECT_FULL = `${SERVER_SELECT_COLUMNS}, ui_text_scale, is_public`;
+
+const SERVER_SELECT_LEGACY = `id, name, invite_code, owner_id, description, region, invites_paused,
+              verification_level, default_notifications, explicit_content_filter,
+              afk_timeout_minutes, created_at, icon_url`;
 
 export function serverIconStorageKey(serverId: string, extension: string): string {
   return `server-icons/${serverId}/icon.${extension}`;
@@ -63,6 +69,8 @@ export function mapServer(server: ServerRow) {
     defaultNotifications: server.default_notifications,
     explicitContentFilter: server.explicit_content_filter === 1,
     afkTimeoutMinutes: server.afk_timeout_minutes,
+    afkChannelId: server.afk_channel_id ?? null,
+    vanityUrl: server.vanity_url ?? null,
     uiTextScale: server.ui_text_scale ?? 100,
     isPublic: server.is_public === 1,
     createdAt: server.created_at,
@@ -82,18 +90,28 @@ export async function getServerById(
   } catch (error) {
     if (
       !isMissingColumnError(error, "ui_text_scale") &&
-      !isMissingColumnError(error, "is_public")
+      !isMissingColumnError(error, "is_public") &&
+      !isMissingColumnError(error, "afk_channel_id") &&
+      !isMissingColumnError(error, "vanity_url")
     ) {
       throw error;
     }
   }
 
   const server = await db
-    .prepare(`SELECT ${SERVER_SELECT_COLUMNS} FROM servers WHERE id = ? LIMIT 1`)
+    .prepare(`SELECT ${SERVER_SELECT_LEGACY}, ui_text_scale, is_public FROM servers WHERE id = ? LIMIT 1`)
     .bind(serverId)
     .first<ServerRow>();
 
-  return server ? { ...server, ui_text_scale: 100, is_public: 0 } : null;
+  return server
+    ? {
+        ...server,
+        ui_text_scale: server.ui_text_scale ?? 100,
+        is_public: server.is_public ?? 0,
+        afk_channel_id: server.afk_channel_id ?? null,
+        vanity_url: server.vanity_url ?? null,
+      }
+    : null;
 }
 
 export interface PublicServerRow {

@@ -14,6 +14,7 @@ export interface MessageRow {
   deleted_at: string | null;
   thread_archived?: number;
   thread_locked?: number;
+  sticker_id?: string | null;
 }
 
 let messageThreadColumnsReady: Promise<void> | null = null;
@@ -79,6 +80,7 @@ export interface CreateMessageInput {
   threadRootId?: string | null;
   replyToId?: string | null;
   attachmentIds?: string[];
+  stickerId?: string | null;
 }
 
 export interface MessageDto {
@@ -125,6 +127,7 @@ export interface MessageDto {
   }>;
   threadArchived: boolean;
   threadLocked: boolean;
+  sticker: { id: string; name: string; url: string } | null;
 }
 
 export function validateMessageContent(content: string): string | null {
@@ -203,7 +206,7 @@ export async function listChannelMessages(
     const result = await db
       .prepare(
         `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at,
-                thread_archived, thread_locked
+                thread_archived, thread_locked, sticker_id
          FROM messages
          WHERE channel_id = ?
            AND ((? IS NULL AND thread_root_id IS NULL) OR thread_root_id = ?)
@@ -218,7 +221,7 @@ export async function listChannelMessages(
     const result = await db
       .prepare(
         `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at,
-                thread_archived, thread_locked
+                thread_archived, thread_locked, sticker_id
          FROM messages
          WHERE channel_id = ?
            AND ((? IS NULL AND thread_root_id IS NULL) OR thread_root_id = ?)
@@ -244,7 +247,7 @@ export async function getMessageById(
   const row = await db
     .prepare(
       `SELECT id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, created_at, edited_at, deleted_at,
-              thread_archived, thread_locked
+              thread_archived, thread_locked, sticker_id
        FROM messages WHERE id = ? AND channel_id = ? LIMIT 1`,
     )
     .bind(messageId, channelId)
@@ -362,6 +365,20 @@ async function hydrateMessages(
     embedsByMessage.set(embed.message_id, list);
   }
 
+  const stickerIds = [...new Set(rows.map((row) => row.sticker_id).filter(Boolean))] as string[];
+  const stickerMap = new Map<string, { id: string; name: string }>();
+  if (stickerIds.length > 0) {
+    const stickerRows = await db
+      .prepare(
+        `SELECT id, name FROM server_stickers WHERE id IN (${stickerIds.map(() => "?").join(", ")})`,
+      )
+      .bind(...stickerIds)
+      .all<{ id: string; name: string }>();
+    for (const sticker of stickerRows.results ?? []) {
+      stickerMap.set(sticker.id, sticker);
+    }
+  }
+
   return rows.map((row) => {
     const author = authors.get(row.author_id);
     const reactionMap = reactionsByMessage.get(row.id) ?? new Map();
@@ -406,6 +423,18 @@ async function hydrateMessages(
       })),
       threadArchived: (row.thread_archived ?? 0) === 1,
       threadLocked: (row.thread_locked ?? 0) === 1,
+      sticker: row.sticker_id
+        ? (() => {
+            const sticker = stickerMap.get(row.sticker_id!);
+            return sticker
+              ? {
+                  id: sticker.id,
+                  name: sticker.name,
+                  url: `/api/servers/${serverId}/stickers/${sticker.id}`,
+                }
+              : null;
+          })()
+        : null,
     };
   });
 }
@@ -512,7 +541,7 @@ export async function listPinnedMessages(
   const result = await db
     .prepare(
       `SELECT m.id, m.channel_id, m.server_id, m.author_id, m.content, m.thread_root_id, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at,
-              m.thread_archived, m.thread_locked
+              m.thread_archived, m.thread_locked, m.sticker_id
        FROM pinned_messages pm
        INNER JOIN messages m ON m.id = pm.message_id
        WHERE pm.channel_id = ?

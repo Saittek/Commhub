@@ -11,6 +11,7 @@ import { type RolePermissions } from "./lib/permissions";
 import { hashWebhookToken, generateWebhookToken } from "./lib/webhooks";
 import { broadcastTextEvent } from "./message-routes";
 import { setUserPresence, type PresenceStatus } from "./lib/discord-features";
+import { getServerBoostPerks } from "./lib/boost-limits";
 
 function jsonError(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
@@ -262,6 +263,16 @@ export function registerDiscordExtraRoutes(app: Hono<{ Bindings: Env }>) {
     }
     if (!EMOJI_TYPES.has(file.type) || file.size > MAX_EMOJI_BYTES) {
       return jsonError("Emoji must be PNG/GIF/WebP/JPEG under 256KB.", 400);
+    }
+
+    const perks = await getServerBoostPerks(c.env.DB, server.id);
+    const emojiCount = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM server_emojis WHERE server_id = ?",
+    )
+      .bind(server.id)
+      .first<{ count: number }>();
+    if ((emojiCount?.count ?? 0) >= perks.emojiSlots) {
+      return jsonError(`Emoji slots full (${perks.emojiSlots} at boost level ${perks.boostLevel}).`, 400);
     }
 
     const emojiId = newId();

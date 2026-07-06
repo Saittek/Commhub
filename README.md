@@ -81,12 +81,13 @@ Before inviting real users:
 2. **R2** — confirm the assets bucket exists and is bound in `wrangler.jsonc`.
 3. **Secrets** — set OAuth (`GITHUB_*`, `GOOGLE_*`), `SESSION_SECRET`, and VAPID keys for push notifications.
 4. **Voice** — mesh WebRTC works for small groups (platform cap: 25 users per voice channel). For larger or more reliable calls, plan a move to an SFU such as [Cloudflare Calls](https://developers.cloudflare.com/calls/) and replace peer mesh signaling in `VoiceRoom` / `voice-client.ts`.
-5. **TURN/STUN** — Google STUN is used by default. For production, set optional client env vars:
+5. **TURN/STUN** — Google STUN and Cloudflare STUN are used by default. For production, set optional client env vars:
    - `VITE_TURN_URL` (e.g. `turn:turn.example.com:3478`)
    - `VITE_TURN_USERNAME`
    - `VITE_TURN_CREDENTIAL`
-6. **Custom domain** — route your domain to the Worker and enable HTTPS (required for mic/camera/screen share).
-7. **Push** — register the service worker and verify push subscribe with your VAPID keys.
+6. **SFU (optional)** — For calls above ~15 users, migrate voice signaling to [Cloudflare Calls](https://developers.cloudflare.com/calls/) and replace mesh WebRTC in `VoiceRoom` / `voice-client.ts`. Until then, mesh works up to the 25-user platform cap.
+7. **Custom domain** — route your domain to the Worker and enable HTTPS (required for mic/camera/screen share).
+8. **Push** — set `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` worker secrets and `VITE_VAPID_PUBLIC_KEY` for the client; register the service worker and verify push subscribe.
 
 ## Voice architecture notes
 

@@ -19,16 +19,26 @@ import { resolveHomePath } from "../lib/navigation";
 import { shouldShowVoiceStage } from "../lib/voice-stage";
 import { getVoiceVideoPreferences } from "../lib/voice-video-settings";
 import { useVoiceShortcuts } from "../hooks/useVoiceShortcuts";
+import ForumChannelPanel from "../components/ForumChannelPanel";
+import GlobalSearchModal from "../components/GlobalSearchModal";
+import PwaInstallPrompt from "../components/PwaInstallPrompt";
 import DmPopout from "../components/DmPopout";
 
-function resolveTextChannelId(channels: Channel[], preferredId?: string | null): string | null {
+function resolveMessageChannelId(channels: Channel[], preferredId?: string | null): string | null {
   if (preferredId) {
     const preferred = channels.find((channel) => channel.id === preferredId);
-    if (preferred?.type === "text") {
+    if (preferred?.type === "text" || preferred?.type === "announcement") {
+      return preferredId;
+    }
+    if (preferred?.type === "forum") {
       return preferredId;
     }
   }
-  return channels.find((channel) => channel.type === "text")?.id ?? null;
+  return (
+    channels.find((channel) => channel.type === "text")?.id ??
+    channels.find((channel) => channel.type === "announcement")?.id ??
+    null
+  );
 }
 
 export default function AppPage() {
@@ -56,10 +66,13 @@ export default function AppPage() {
     () => typeof window !== "undefined" && !localStorage.getItem(VOICE_SETUP_DONE_KEY),
   );
   const [joiningVoiceInvite, setJoiningVoiceInvite] = useState(false);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
 
   const activeServer = servers.find((server) => server.id === activeServerId) ?? servers[0] ?? null;
+  const activeChannel = channels.find((channel) => channel.id === activeChannelId) ?? null;
   const activeTextChannel =
-    channels.find((channel) => channel.id === activeChannelId && channel.type === "text") ?? null;
+    activeChannel?.type === "text" || activeChannel?.type === "announcement" ? activeChannel : null;
+  const activeForumChannel = activeChannel?.type === "forum" ? activeChannel : null;
 
   const voice = useVoice();
   const inVoiceStage = shouldShowVoiceStage(voice);
@@ -124,7 +137,7 @@ export default function AppPage() {
         return;
       }
 
-      const nextId = resolveTextChannelId(response.channels, preferredChannelId);
+      const nextId = resolveMessageChannelId(response.channels, preferredChannelId);
 
       setActiveChannelId(nextId);
       void loadUnread(serverId);
@@ -217,7 +230,7 @@ export default function AppPage() {
 
   function handleChannelCreated(channel: Channel) {
     setChannels((current) => [...current, channel]);
-    if (channel.type === "text") {
+    if (channel.type === "text" || channel.type === "announcement" || channel.type === "forum") {
       setActiveChannelId(channel.id);
     }
   }
@@ -235,7 +248,7 @@ export default function AppPage() {
     setChannels((current) => {
       const next = current.filter((item) => item.id !== channelId);
       if (activeChannelId === channelId) {
-        setActiveChannelId(resolveTextChannelId(next));
+        setActiveChannelId(resolveMessageChannelId(next));
       }
       return next;
     });
@@ -304,7 +317,7 @@ export default function AppPage() {
               return;
             }
 
-            if (channel.type === "voice") {
+            if (channel.type === "voice" || channel.type === "stage") {
               if (!activeServer) {
                 return;
               }
@@ -344,17 +357,26 @@ export default function AppPage() {
                 <FriendsIcon className="app-header-channel-icon" />
                 <h1>Friends</h1>
               </>
-            ) : activeTextChannel ? (
+            ) : activeTextChannel || activeForumChannel ? (
               <>
                 <span className="app-header-channel-icon" aria-hidden="true">
                   <HashIcon />
                 </span>
-                <h1>{activeTextChannel.name}</h1>
+                <h1>{(activeTextChannel ?? activeForumChannel)!.name}</h1>
               </>
             ) : (
               <h1>{activeServer?.name ?? "Your Server"}</h1>
             )}
           </div>
+          {activeServer && !showFriends && (
+            <button
+              type="button"
+              className="secondary-button app-header-search-btn"
+              onClick={() => setGlobalSearchOpen(true)}
+            >
+              Search
+            </button>
+          )}
         </header>
         )}
 
@@ -362,7 +384,7 @@ export default function AppPage() {
           className={
             inVoiceStage
               ? "app-content voice-stage-content"
-              : activeTextChannel
+              : activeTextChannel || activeForumChannel
                 ? "app-content text-channel-view"
                 : "app-placeholder"
           }
@@ -415,6 +437,13 @@ export default function AppPage() {
                     }
                   : null
               }
+            />
+          ) : !loading && activeForumChannel && user ? (
+            <ForumChannelPanel
+              serverId={activeServer!.id}
+              channelId={activeForumChannel.id}
+              channelName={activeForumChannel.name}
+              currentUserId={user.id}
             />
           ) : !loading && activeTextChannel && user ? (
             <TextChannelPanel
@@ -512,6 +541,18 @@ export default function AppPage() {
           }}
         />
       )}
+
+      {activeServer && (
+        <GlobalSearchModal
+          serverId={activeServer.id}
+          open={globalSearchOpen}
+          onClose={() => setGlobalSearchOpen(false)}
+          onSelectMessage={(channelId, _messageId) => setActiveChannelId(channelId)}
+          onSelectForumPost={(channelId) => setActiveChannelId(channelId)}
+        />
+      )}
+
+      <PwaInstallPrompt />
     </div>
   );
 }

@@ -24,6 +24,7 @@ import {
   getServerBoosts,
   getServerBots,
   getServerChannels,
+  type Channel,
   getServerEmojis,
   getServerInvites,
   getServerMembers,
@@ -52,7 +53,6 @@ import {
   type ServerBan,
   type ServerInvite,
   type ServerMember,
-  type Channel,
   type UpdateServerPayload,
 } from "../lib/api";
 import { validateAvatarSourceFile } from "../lib/avatar";
@@ -146,6 +146,7 @@ export default function ServerSettingsPanel({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [voiceChannels, setVoiceChannels] = useState<Channel[]>([]);
   const [deleteConfirm, setDeleteConfirm] = useState("");
   const [uploadingIcon, setUploadingIcon] = useState(false);
   const [cropFile, setCropFile] = useState<File | null>(null);
@@ -188,16 +189,22 @@ export default function ServerSettingsPanel({
       setError(null);
 
       try {
-        const [serverResponse, membersResponse, permissionsResponse] = await Promise.all([
+        const [serverResponse, membersResponse, permissionsResponse, channelsResponse] = await Promise.all([
           getServer(serverId),
           getServerMembers(serverId),
           getMyPermissions(serverId),
+          getServerChannels(serverId),
         ]);
 
         if (!cancelled) {
           setServer(serverResponse.server);
           setMembers(membersResponse.members);
           setPermissions(permissionsResponse.permissions);
+          setVoiceChannels(
+            channelsResponse.channels.filter(
+              (channel) => channel.type === "voice" || channel.type === "stage",
+            ),
+          );
         }
       } catch (err) {
         if (!cancelled) {
@@ -285,6 +292,8 @@ export default function ServerSettingsPanel({
       verificationLevel: Number(formData.get("verificationLevel") ?? 0),
       defaultNotifications: String(formData.get("defaultNotifications") ?? "all"),
       explicitContentFilter: formData.get("explicitContentFilter") === "on",
+      afkTimeoutMinutes: Number(formData.get("afkTimeoutMinutes") ?? server.afkTimeoutMinutes ?? 5),
+      afkChannelId: String(formData.get("afkChannelId") ?? "") || null,
     });
   }
 
@@ -734,6 +743,35 @@ export default function ServerSettingsPanel({
                   </p>
                   <div className="settings-card">
                     <div>
+                      <strong>Vanity URL</strong>
+                      <p className="settings-muted">
+                        Optional custom slug for joins (e.g. commhub.gg/join/my-server).
+                      </p>
+                    </div>
+                    <form
+                      className="settings-inline"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        const formData = new FormData(event.currentTarget);
+                        void saveSettings({
+                          vanityUrl: String(formData.get("vanityUrl") ?? "").trim().toLowerCase() || null,
+                        });
+                      }}
+                    >
+                      <input
+                        name="vanityUrl"
+                        defaultValue={server.vanityUrl ?? ""}
+                        placeholder="my-server"
+                        pattern="[a-z0-9-]{2,32}"
+                        disabled={saving}
+                      />
+                      <button type="submit" className="secondary-button" disabled={saving}>
+                        Save
+                      </button>
+                    </form>
+                  </div>
+                  <div className="settings-card">
+                    <div>
                       <strong>Invite Code</strong>
                       <p className="settings-muted">Share this code so others can join.</p>
                     </div>
@@ -870,6 +908,28 @@ export default function ServerSettingsPanel({
                       disabled={saving}
                     />
                     Scan media from all members for explicit content
+                  </label>
+                  <label>
+                    AFK Timeout (minutes)
+                    <input
+                      type="number"
+                      name="afkTimeoutMinutes"
+                      min={1}
+                      max={60}
+                      defaultValue={server.afkTimeoutMinutes ?? 5}
+                      disabled={saving}
+                    />
+                  </label>
+                  <label>
+                    AFK Channel
+                    <select name="afkChannelId" defaultValue={server.afkChannelId ?? ""} disabled={saving}>
+                      <option value="">None</option>
+                      {voiceChannels.map((channel) => (
+                        <option key={channel.id} value={channel.id}>
+                          {channel.name} ({channel.type})
+                        </option>
+                      ))}
+                    </select>
                   </label>
                   <button type="submit" disabled={saving}>
                     {saving ? "Saving..." : "Save Changes"}

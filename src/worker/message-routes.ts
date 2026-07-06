@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import type { TokenPayload } from "./lib/auth";
-import { getServerChannel } from "./lib/channels";
+import { getServerChannel, isMessageChannelType } from "./lib/channels";
 import { requireServerMember } from "./lib/server-access";
 import {
   contentMentionsEveryone,
@@ -25,10 +25,11 @@ import { getPrivacySettings } from "./lib/privacy";
 import { checkAutomod, isMemberTimedOut } from "./lib/discord-features";
 import { extractUrls, storeEmbedsForMessage } from "./lib/embed-fetch";
 import { TextRoom } from "./text-room";
+import { getServerBoostPerks, uploadLimitBytes } from "./lib/boost-limits";
+import { notifyChannelMessage } from "./lib/push-notify";
 
 export { TextRoom };
 
-const MAX_ATTACHMENT_SIZE = 8 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -66,7 +67,31 @@ export async function broadcastTextEvent(
   }
 }
 
-async function requireTextChannel(
+export async function broadcastDmEvent(
+  env: Env,
+  channelId: string,
+  event: Record<string, unknown>,
+): Promise<void> {
+  if (!env.TEXT_ROOM) {
+    return;
+  }
+
+  try {
+    const roomId = env.TEXT_ROOM.idFromName(`dm-${channelId}`);
+    const stub = env.TEXT_ROOM.get(roomId);
+    await stub.fetch(
+      new Request("https://text-room/broadcast", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(event),
+      }),
+    );
+  } catch {
+    // Real-time is best-effort.
+  }
+}
+
+async function requireMessageChannel(
   c: Context<{ Bindings: Env }>,
   user: TokenPayload,
   serverId: string,
@@ -82,11 +107,21 @@ async function requireTextChannel(
     return jsonError("Channel not found.", 404);
   }
 
-  if (channel.type !== "text") {
-    return jsonError("This channel is not a text channel.", 400);
+  if (!isMessageChannelType(channel.type)) {
+    return jsonError("This channel is not a message channel.", 400);
   }
 
   return { server, channel };
+}
+
+/** @deprecated use requireMessageChannel */
+async function requireTextChannel(
+  c: Context<{ Bindings: Env }>,
+  user: TokenPayload,
+  serverId: string,
+  channelId: string,
+) {
+  return requireMessageChannel(c, user, serverId, channelId);
 }
 
 async function checkSlowMode(
@@ -211,6 +246,20 @@ export async function handleCreateMessage(
 
   const body = await c.req.json<CreateMessageInput>();
   const content = (body.content ?? "").trim();
+  const stickerId = body.stickerId?.trim() || null;
+
+  if (result.channel.type === "announcement") {
+    const canAnnounce = await memberHasPermission(
+      c.env.DB,
+      result.server.id,
+      user.sub,
+      result.server.owner_id,
+      "manage_messages",
+    );
+    if (!canAnnounce) {
+      return jsonError("Only moderators can post in announcement channels.", 403);
+    }
+  }
 
   if (content.startsWith("/")) {
     const commandName = content.slice(1).split(/\s+/)[0]?.toLowerCase();
@@ -231,8 +280,19 @@ export async function handleCreateMessage(
   }
 
   const validationError = validateMessageContent(content);
-  if (validationError && !(body.attachmentIds?.length ?? 0)) {
+  if (validationError && !(body.attachmentIds?.length ?? 0) && !stickerId) {
     return jsonError(validationError, 400);
+  }
+
+  if (stickerId) {
+    const sticker = await c.env.DB.prepare(
+      "SELECT id FROM server_stickers WHERE id = ? AND server_id = ? LIMIT 1",
+    )
+      .bind(stickerId, result.server.id)
+      .first<{ id: string }>();
+    if (!sticker) {
+      return jsonError("Sticker not found.", 404);
+    }
   }
 
   const automodError = await checkAutomod(c.env.DB, result.server.id, content);
@@ -308,8 +368,8 @@ export async function handleCreateMessage(
 
   const messageId = crypto.randomUUID();
   await c.env.DB.prepare(
-    `INSERT INTO messages (id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, channel_id, server_id, author_id, content, thread_root_id, reply_to_id, sticker_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       messageId,
@@ -319,6 +379,7 @@ export async function handleCreateMessage(
       content,
       threadRootId,
       body.replyToId ?? null,
+      stickerId,
     )
     .run();
 
@@ -344,6 +405,24 @@ export async function handleCreateMessage(
   }
 
   await broadcastTextEvent(c.env, channelId, { type: "message-create", message });
+
+  const channelNameRow = await c.env.DB.prepare("SELECT name FROM channels WHERE id = ? LIMIT 1")
+    .bind(channelId)
+    .first<{ name: string }>();
+
+  const mentionMatches = content.match(/<@([a-f0-9-]{36})>/gi) ?? [];
+  const mentionUserIds = mentionMatches.map((m) => m.slice(2, -1));
+
+  void notifyChannelMessage(
+    c.env,
+    result.server.id,
+    channelId,
+    channelNameRow?.name ?? "channel",
+    user.sub,
+    message.author.displayName,
+    content,
+    mentionUserIds,
+  );
 
   return c.json({ message }, 201);
 }
@@ -766,8 +845,10 @@ export async function handleUploadAttachment(
     return jsonError("No file provided.", 400);
   }
 
-  if (file.size > MAX_ATTACHMENT_SIZE) {
-    return jsonError("File must be 8 MB or smaller.", 400);
+  const perks = await getServerBoostPerks(c.env.DB, result.server.id);
+  const maxBytes = uploadLimitBytes(perks);
+  if (file.size > maxBytes) {
+    return jsonError(`File must be ${perks.uploadLimitMb} MB or smaller.`, 400);
   }
 
   const contentType = file.type || "application/octet-stream";

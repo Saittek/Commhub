@@ -24,6 +24,8 @@ interface PeerAttachment {
   speaking: boolean;
   cameraEnabled: boolean;
   screenSharing: boolean;
+  lastActivityAt: number;
+  serverId: string;
 }
 
 interface RTCIceCandidateInit {
@@ -61,9 +63,10 @@ type InboundMessage =
       speaking?: boolean;
       cameraEnabled?: boolean;
       screenSharing?: boolean;
-    };
+    }
+  | { type: "play-sound"; soundId: string; soundUrl: string; soundName: string };
 
-export class VoiceRoom extends DurableObject {
+export class VoiceRoom extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
   }
@@ -79,6 +82,10 @@ export class VoiceRoom extends DurableObject {
       return this.handleMove(request);
     }
 
+    if (url.pathname === "/afk-check" && request.method === "POST") {
+      return this.handleAfkCheck(request);
+    }
+
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade.", { status: 426 });
     }
@@ -87,6 +94,7 @@ export class VoiceRoom extends DurableObject {
     const displayName = request.headers.get("X-Display-Name");
     const username = request.headers.get("X-Username");
     const userLimitHeader = request.headers.get("X-Voice-User-Limit");
+    const serverId = request.headers.get("X-Server-Id") ?? "";
 
     if (!userId || !displayName || !username) {
       return new Response("Missing voice session headers.", { status: 400 });
@@ -124,10 +132,17 @@ export class VoiceRoom extends DurableObject {
       speaking: false,
       cameraEnabled: false,
       screenSharing: false,
+      lastActivityAt: Date.now(),
+      serverId,
     };
 
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment(attachment);
+
+    const currentAlarm = await this.ctx.storage.getAlarm();
+    if (currentAlarm === null) {
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    }
 
     const peers = this.getPeers().filter((peer) => peer.userId !== userId);
     server.send(JSON.stringify({ type: "welcome", peers }));
@@ -165,6 +180,30 @@ export class VoiceRoom extends DurableObject {
 
     if (payload.type === "update-state") {
       this.updatePeerState(ws, attachment, payload);
+      return;
+    }
+
+    if (payload.type === "play-sound") {
+      attachment.lastActivityAt = Date.now();
+      ws.serializeAttachment(attachment);
+      this.broadcast(
+        JSON.stringify({
+          type: "sound-played",
+          soundId: payload.soundId,
+          soundUrl: payload.soundUrl,
+          soundName: payload.soundName,
+          userId: attachment.userId,
+          displayName: attachment.displayName,
+        }),
+        ws,
+      );
+    }
+  }
+
+  async alarm(): Promise<void> {
+    await this.runAfkCheck();
+    if (this.ctx.getWebSockets().length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
     }
   }
 
@@ -234,6 +273,7 @@ export class VoiceRoom extends DurableObject {
       attachment.screenSharing = payload.screenSharing;
     }
 
+    attachment.lastActivityAt = Date.now();
     ws.serializeAttachment(attachment);
     this.broadcast(
       JSON.stringify({
@@ -384,6 +424,76 @@ export class VoiceRoom extends DurableObject {
       cameraEnabled: attachment.cameraEnabled,
       screenSharing: attachment.screenSharing,
     };
+  }
+
+  private async handleAfkCheck(_request: Request): Promise<Response> {
+    await this.runAfkCheck();
+    return Response.json({ ok: true });
+  }
+
+  private async runAfkCheck(): Promise<void> {
+    const sockets = this.ctx.getWebSockets();
+    if (sockets.length === 0) {
+      return;
+    }
+
+    const first = sockets[0].deserializeAttachment() as PeerAttachment | null;
+    const serverId = first?.serverId;
+    if (!serverId || !this.env.DB) {
+      return;
+    }
+
+    const server = await this.env.DB.prepare(
+      "SELECT afk_timeout_minutes, afk_channel_id FROM servers WHERE id = ? LIMIT 1",
+    )
+      .bind(serverId)
+      .first<{ afk_timeout_minutes: number; afk_channel_id: string | null }>();
+
+    if (!server?.afk_channel_id || server.afk_timeout_minutes <= 0) {
+      return;
+    }
+
+    const afkChannel = await this.env.DB.prepare(
+      "SELECT id, name FROM channels WHERE id = ? AND server_id = ? LIMIT 1",
+    )
+      .bind(server.afk_channel_id, serverId)
+      .first<{ id: string; name: string }>();
+
+    if (!afkChannel) {
+      return;
+    }
+
+    const serverNameRow = await this.env.DB.prepare("SELECT name FROM servers WHERE id = ? LIMIT 1")
+      .bind(serverId)
+      .first<{ name: string }>();
+
+    const idleMs = server.afk_timeout_minutes * 60_000;
+    const now = Date.now();
+
+    for (const socket of sockets) {
+      const attachment = socket.deserializeAttachment() as PeerAttachment | null;
+      if (!attachment || attachment.deafened || attachment.serverDeafened) {
+        continue;
+      }
+      if (now - attachment.lastActivityAt < idleMs) {
+        continue;
+      }
+
+      socket.send(
+        JSON.stringify({
+          type: "moved",
+          channelId: afkChannel.id,
+          channelName: afkChannel.name,
+          serverId,
+          serverName: serverNameRow?.name ?? "",
+        }),
+      );
+      socket.close(4000, "Moved to AFK");
+      this.broadcast(
+        JSON.stringify({ type: "peer-left", userId: attachment.userId }),
+        socket,
+      );
+    }
   }
 
   private broadcast(message: string, except?: WebSocket) {

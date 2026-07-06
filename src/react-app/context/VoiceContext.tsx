@@ -54,6 +54,7 @@ interface VoiceContextValue {
   clearError: () => void;
   updateVoiceVideoSettings: (prefs: VoiceVideoPreferences) => Promise<void>;
   retryVoiceConnection: () => Promise<void>;
+  playSoundboard: (sound: { id: string; url: string; name: string }) => void;
 }
 
 const EMPTY_LOCAL_MEDIA: LocalVoiceMedia = {
@@ -322,6 +323,10 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const playSoundboard = useCallback((sound: { id: string; url: string; name: string }) => {
+    clientRef.current?.playSoundboard(sound);
+  }, []);
+
   const isJoined = joined !== null && connectionState === "connected";
 
   const value: VoiceContextValue = {
@@ -345,6 +350,7 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
     clearError,
     updateVoiceVideoSettings,
     retryVoiceConnection,
+    playSoundboard,
   };
 
   return <VoiceContext.Provider value={value}>{children}</VoiceContext.Provider>;
