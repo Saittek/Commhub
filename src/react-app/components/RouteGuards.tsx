@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Navigate, Outlet } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import { VoiceProvider } from "../context/VoiceContext";
 import { getMyServers } from "../lib/api";
 import { resolveHomePath } from "../lib/navigation";
 
@@ -163,5 +164,9 @@ export function AppRoute() {
     return <Navigate to="/onboarding" replace />;
   }
 
-  return <Outlet />;
+  return (
+    <VoiceProvider>
+      <Outlet />
+    </VoiceProvider>
+  );
 }

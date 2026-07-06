@@ -98,7 +98,6 @@ import {
   enforceJoinSafety,
   mapOnlineMembersForServer,
   writeAuditLog,
-  checkVerificationLevel,
 } from "./safety-routes";
 import { registerDiscordRoutes } from "./discord-routes";
 import { registerDiscordExtraRoutes } from "./discord-routes-extra";
@@ -108,7 +107,7 @@ import { registerOAuthRoutes } from "./oauth-routes";
 import { registerPlatformRoutes } from "./platform-routes";
 import { registerForumRoutes } from "./forum-routes";
 import { registerCallsRoutes } from "./calls-routes";
-import { isMemberTimedOut } from "./lib/discord-features";
+import { requireVoiceChannelAccess } from "./lib/voice-access";
 import { ensurePrivacySettings } from "./lib/privacy";
 import { buildUserProfile } from "./lib/user-profile";
 
@@ -1440,53 +1439,21 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
     return user;
   }
 
-  const server = await requireServerMember(c, user, c.req.param("serverId"));
-  if (server instanceof Response) {
-    return server;
-  }
-
   if (!c.env.VOICE_ROOM) {
     return jsonError("Voice service is unavailable. Restart the dev server.", 503);
   }
 
-  const channelId = c.req.param("channelId");
-  const channel = await getServerChannel(c.env.DB, server.id, channelId);
-
-  if (!channel) {
-    return jsonError("Channel not found.", 404);
-  }
-
-  if (!isVoiceLikeType(channel.type)) {
-    return jsonError("This channel is not a voice channel.", 400);
-  }
-
-  const verificationError = await checkVerificationLevel(c.env.DB, server, user.sub);
-  if (verificationError) {
-    return jsonError(verificationError, 403);
-  }
-
-  const canConnect = await memberHasPermission(
-    c.env.DB,
-    server.id,
-    user.sub,
-    server.owner_id,
-    "connect_voice",
+  const access = await requireVoiceChannelAccess(
+    c,
+    user,
+    c.req.param("serverId"),
+    c.req.param("channelId"),
   );
-  if (!canConnect) {
-    return jsonError("You do not have permission to join voice channels.", 403);
+  if (access instanceof Response) {
+    return access;
   }
 
-  if (await isMemberTimedOut(c.env.DB, server.id, user.sub)) {
-    return jsonError("You are timed out and cannot join voice channels.", 403);
-  }
-
-  const canSpeak = await memberHasPermission(
-    c.env.DB,
-    server.id,
-    user.sub,
-    server.owner_id,
-    "speak_voice",
-  );
+  const { server, channel, canSpeak } = access;
 
   const profile = await c.env.DB.prepare(
     "SELECT username, display_name FROM users WHERE id = ? LIMIT 1",
@@ -1526,7 +1493,7 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
       headers.set("X-Calls-Session-Id", callsSessionId.trim());
     }
 
-    const roomId = c.env.VOICE_ROOM.idFromName(channelId);
+    const roomId = c.env.VOICE_ROOM.idFromName(channel.id);
     const stub = c.env.VOICE_ROOM.get(roomId);
     const upgradeRequest = new Request(c.req.raw, { headers });
     return await stub.fetch(upgradeRequest);

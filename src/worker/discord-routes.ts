@@ -2,8 +2,8 @@ import type { Hono } from "hono";
 import { requireUser } from "./lib/session";
 import { requireServerMember, requireManageServer } from "./lib/server-access";
 import { memberHasPermission } from "./lib/user-permissions";
-import { countUnreadMessages } from "./lib/messages";
-import { listServerChannels, getServerChannel, isMessageChannelType } from "./lib/channels";
+import { countUnreadMessagesForServer } from "./lib/messages";
+import { getServerChannel } from "./lib/channels";
 import { broadcastDmEvent } from "./message-routes";
 import { notifyDmMessage } from "./lib/push-notify";
 import { writeAuditLog } from "./safety-routes";
@@ -38,14 +38,7 @@ export function registerDiscordRoutes(app: Hono<{ Bindings: Env }>) {
     const server = await requireServerMember(c, user, c.req.param("serverId"));
     if (server instanceof Response) return server;
 
-    const channels = await listServerChannels(c.env.DB, server.id);
-    const unread: Record<string, number> = {};
-
-    for (const channel of channels) {
-      if (isMessageChannelType(channel.type)) {
-        unread[channel.id] = await countUnreadMessages(c.env.DB, channel.id, user.sub);
-      }
-    }
+    const unread = await countUnreadMessagesForServer(c.env.DB, server.id, user.sub);
 
     return c.json({ unread });
   });

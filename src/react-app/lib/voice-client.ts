@@ -156,6 +156,8 @@ export class VoiceClient {
   private sfu: VoiceCallsSfu | null = null;
   private useSfu = false;
   private pulledTrackKeys = new Set<string>();
+  private lastSpeakingBroadcastAt = 0;
+  private readonly speakingBroadcastMinMs = 300;
 
   constructor(options: VoiceClientOptions) {
     this.serverId = options.serverId;
@@ -749,6 +751,22 @@ export class VoiceClient {
     this.ws?.send(JSON.stringify({ type: "update-state", ...state }));
   }
 
+  private broadcastSpeakingState(speaking: boolean) {
+    const now = Date.now();
+    if (!speaking) {
+      this.lastSpeakingBroadcastAt = now;
+      this.sendStateUpdate({ speaking: false });
+      return;
+    }
+
+    if (now - this.lastSpeakingBroadcastAt < this.speakingBroadcastMinMs) {
+      return;
+    }
+
+    this.lastSpeakingBroadcastAt = now;
+    this.sendStateUpdate({ speaking: true });
+  }
+
   private getPublishedTracks(): Array<{ track: MediaStreamTrack; stream: MediaStream }> {
     const published: Array<{ track: MediaStreamTrack; stream: MediaStream }> = [];
 
@@ -775,14 +793,17 @@ export class VoiceClient {
 
   private async publishStreamTracks(stream: MediaStream): Promise<void> {
     if (this.useSfu && this.sfu) {
-      for (const track of stream.getTracks()) {
-        if (track.kind === "video") {
-          const trackName = trackNameFor(
-            isScreenShareTrack(track) ? "screen" : "camera",
-            this.localUserId,
-          );
-          await this.sfu.publishTrack(trackName, track);
-        }
+      const tracks = stream.getTracks().filter((track) => track.kind === "video");
+      if (tracks.length > 0) {
+        await this.sfu.publishTracks(
+          tracks.map((track) => ({
+            trackName: trackNameFor(
+              isScreenShareTrack(track) ? "screen" : "camera",
+              this.localUserId,
+            ),
+            track,
+          })),
+        );
       }
       this.announceTracks();
       return;
@@ -1125,7 +1146,7 @@ export class VoiceClient {
       if (!this.analyser || this.muted || this.deafened) {
         if (this.speaking) {
           this.speaking = false;
-          this.sendStateUpdate({ speaking: false });
+          this.broadcastSpeakingState(false);
           this.onLocalSpeakingChange?.(false);
         }
         if (!this.pttOnly && this.vadActive) {
@@ -1162,7 +1183,7 @@ export class VoiceClient {
 
       if (nextSpeaking !== this.speaking) {
         this.speaking = nextSpeaking;
-        this.sendStateUpdate({ speaking: nextSpeaking });
+        this.broadcastSpeakingState(nextSpeaking);
         this.onLocalSpeakingChange?.(nextSpeaking);
       }
     }, 120);

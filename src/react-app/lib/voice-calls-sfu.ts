@@ -90,17 +90,35 @@ export class VoiceCallsSfu {
   }
 
   async publishTrack(trackName: string, track: MediaStreamTrack): Promise<void> {
-    const pc = this.requirePeerConnection();
-    let entry = this.published.get(trackName);
+    await this.publishTracks([{ trackName, track }]);
+  }
 
-    if (entry) {
-      await entry.transceiver.sender.replaceTrack(track);
+  async publishTracks(
+    tracks: Array<{ trackName: string; track: MediaStreamTrack }>,
+  ): Promise<void> {
+    if (tracks.length === 0) {
       return;
     }
 
-    const transceiver = pc.addTransceiver(track, { direction: "sendonly" });
-    entry = { transceiver };
-    this.published.set(trackName, entry);
+    const pc = this.requirePeerConnection();
+    const pending: Array<{ trackName: string; track: MediaStreamTrack; transceiver: RTCRtpTransceiver }> =
+      [];
+
+    for (const { trackName, track } of tracks) {
+      const existing = this.published.get(trackName);
+      if (existing) {
+        await existing.transceiver.sender.replaceTrack(track);
+        continue;
+      }
+
+      const transceiver = pc.addTransceiver(track, { direction: "sendonly" });
+      this.published.set(trackName, { transceiver });
+      pending.push({ trackName, track, transceiver });
+    }
+
+    if (pending.length === 0) {
+      return;
+    }
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -110,17 +128,19 @@ export class VoiceCallsSfu {
         sdp: offer.sdp ?? "",
         type: offer.type,
       },
-      tracks: [
-        {
-          location: "local",
-          mid: transceiver.mid,
-          trackName,
-        },
-      ],
+      tracks: pending.map(({ trackName, transceiver }) => ({
+        location: "local" as const,
+        mid: transceiver.mid,
+        trackName,
+      })),
     });
 
-    if (pushResponse.tracks?.[0]?.mid) {
-      entry.mid = pushResponse.tracks[0].mid;
+    for (let index = 0; index < pending.length; index += 1) {
+      const entry = this.published.get(pending[index].trackName);
+      const mid = pushResponse.tracks?.[index]?.mid;
+      if (entry && mid) {
+        entry.mid = mid;
+      }
     }
 
     if (pushResponse.sessionDescription) {

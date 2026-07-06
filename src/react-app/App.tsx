@@ -1,33 +1,54 @@
+import { lazy, Suspense } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AppRoute, GuestRoute, OnboardingRoute } from "./components/RouteGuards";
 import { AuthProvider } from "./context/AuthContext";
 import { NotificationProvider } from "./context/NotificationContext";
-import { VoiceProvider } from "./context/VoiceContext";
-import AppPage from "./pages/AppPage";
 import AuthPage from "./pages/AuthPage";
-import OnboardingPage from "./pages/OnboardingPage";
+
+const AppPage = lazy(() => import("./pages/AppPage"));
+const OnboardingPage = lazy(() => import("./pages/OnboardingPage"));
+
+function RouteFallback() {
+  return (
+    <div className="loading-screen">
+      <p>Loading...</p>
+    </div>
+  );
+}
 
 export default function App() {
   return (
     <AuthProvider>
       <NotificationProvider>
-        <VoiceProvider>
-          <BrowserRouter>
+        <BrowserRouter>
           <Routes>
             <Route element={<GuestRoute />}>
               <Route path="/" element={<AuthPage />} />
               <Route path="/auth" element={<Navigate to="/" replace />} />
             </Route>
             <Route element={<OnboardingRoute />}>
-              <Route path="/onboarding" element={<OnboardingPage />} />
+              <Route
+                path="/onboarding"
+                element={
+                  <Suspense fallback={<RouteFallback />}>
+                    <OnboardingPage />
+                  </Suspense>
+                }
+              />
             </Route>
             <Route element={<AppRoute />}>
-              <Route path="/app" element={<AppPage />} />
+              <Route
+                path="/app"
+                element={
+                  <Suspense fallback={<RouteFallback />}>
+                    <AppPage />
+                  </Suspense>
+                }
+              />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
-          </BrowserRouter>
-        </VoiceProvider>
+        </BrowserRouter>
       </NotificationProvider>
     </AuthProvider>
   );

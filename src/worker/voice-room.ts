@@ -276,6 +276,14 @@ export class VoiceRoom extends DurableObject<Env> {
   }
 
   private updatePeerState(ws: WebSocket, attachment: PeerAttachment, payload: StateUpdatePayload) {
+    const before = {
+      muted: attachment.muted,
+      deafened: attachment.deafened,
+      speaking: attachment.speaking,
+      cameraEnabled: attachment.cameraEnabled,
+      screenSharing: attachment.screenSharing,
+    };
+
     if (payload.muted !== undefined) {
       attachment.muted = payload.muted;
     }
@@ -302,6 +310,17 @@ export class VoiceRoom extends DurableObject<Env> {
 
     attachment.lastActivityAt = Date.now();
     ws.serializeAttachment(attachment);
+
+    if (
+      before.muted === attachment.muted &&
+      before.deafened === attachment.deafened &&
+      before.speaking === attachment.speaking &&
+      before.cameraEnabled === attachment.cameraEnabled &&
+      before.screenSharing === attachment.screenSharing
+    ) {
+      return;
+    }
+
     this.broadcast(
       JSON.stringify({
         type: "peer-state",

@@ -473,6 +473,49 @@ export async function countUnreadMessages(
   return result?.count ?? 0;
 }
 
+export async function countUnreadMessagesForServer(
+  db: D1Database,
+  serverId: string,
+  userId: string,
+): Promise<Record<string, number>> {
+  const rows = await db
+    .prepare(
+      `SELECT
+         c.id AS channel_id,
+         CASE
+           WHEN crs.last_read_at IS NULL THEN (
+             SELECT COUNT(*)
+             FROM messages m
+             WHERE m.channel_id = c.id
+               AND m.thread_root_id IS NULL
+               AND m.deleted_at IS NULL
+           )
+           ELSE (
+             SELECT COUNT(*)
+             FROM messages m
+             WHERE m.channel_id = c.id
+               AND m.thread_root_id IS NULL
+               AND m.deleted_at IS NULL
+               AND m.created_at > crs.last_read_at
+               AND m.author_id != ?
+           )
+         END AS unread_count
+       FROM channels c
+       LEFT JOIN channel_read_state crs
+         ON crs.channel_id = c.id AND crs.user_id = ?
+       WHERE c.server_id = ?
+         AND c.type IN ('text', 'announcement')`,
+    )
+    .bind(userId, userId, serverId)
+    .all<{ channel_id: string; unread_count: number }>();
+
+  const unread: Record<string, number> = {};
+  for (const row of rows.results ?? []) {
+    unread[row.channel_id] = row.unread_count ?? 0;
+  }
+  return unread;
+}
+
 export async function markChannelRead(
   db: D1Database,
   channelId: string,

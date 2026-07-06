@@ -107,3 +107,33 @@ export async function shouldShowActivityStatus(
   const settings = await getPrivacySettings(db, userId);
   return settings.showActivityStatus;
 }
+
+export async function getActivityVisibilityMap(
+  db: D1Database,
+  userIds: string[],
+): Promise<Map<string, boolean>> {
+  const visibility = new Map<string, boolean>();
+  if (userIds.length === 0) {
+    return visibility;
+  }
+
+  for (const userId of userIds) {
+    visibility.set(userId, true);
+  }
+
+  const placeholders = userIds.map(() => "?").join(", ");
+  const rows = await db
+    .prepare(
+      `SELECT user_id, show_activity_status
+       FROM user_privacy_settings
+       WHERE user_id IN (${placeholders})`,
+    )
+    .bind(...userIds)
+    .all<{ user_id: string; show_activity_status: number }>();
+
+  for (const row of rows.results ?? []) {
+    visibility.set(row.user_id, row.show_activity_status === 1);
+  }
+
+  return visibility;
+}

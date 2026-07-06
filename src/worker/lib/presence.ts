@@ -4,7 +4,7 @@ import {
   type MemberRoleInfo,
   type RankedOnlineMember,
 } from "./member-ranking";
-import { shouldShowActivityStatus } from "./privacy";
+import { getActivityVisibilityMap } from "./privacy";
 
 export const PRESENCE_ONLINE_SECONDS = 90;
 
@@ -24,38 +24,13 @@ export async function touchServerPresence(
     .run();
 }
 
-export async function getOnlineServerMembers(
-  db: D1Database,
-  serverId: string,
-  ownerId: string,
-): Promise<RankedOnlineMember[]> {
-  const membersResult = await db
-    .prepare(
-      `SELECT sm.user_id, u.username, u.display_name, u.avatar_url,
-              CASE WHEN s.owner_id = sm.user_id THEN 1 ELSE 0 END AS is_owner
-       FROM server_members sm
-       INNER JOIN users u ON u.id = sm.user_id
-       INNER JOIN servers s ON s.id = sm.server_id
-       INNER JOIN server_presence sp
-         ON sp.server_id = sm.server_id
-        AND sp.user_id = sm.user_id
-       WHERE sm.server_id = ?
-         AND sp.last_seen_at >= datetime('now', ?)`,
-    )
-    .bind(serverId, `-${PRESENCE_ONLINE_SECONDS} seconds`)
-    .all<{
-      user_id: string;
-      username: string;
-      display_name: string;
-      avatar_url: string | null;
-      is_owner: number;
-    }>();
+interface ServerRoleContext {
+  roleById: Map<string, ReturnType<typeof mapRoleRow>>;
+  everyoneRole: ReturnType<typeof mapRoleRow> | null;
+  assignments: Array<{ user_id: string; role: MemberRoleInfo }>;
+}
 
-  const members = membersResult.results ?? [];
-  if (members.length === 0) {
-    return [];
-  }
-
+async function loadServerRoleContext(db: D1Database, serverId: string): Promise<ServerRoleContext> {
   const rolesResult = await db
     .prepare(
       `SELECT id, name, color, position, permissions, is_everyone
@@ -95,6 +70,43 @@ export async function getOnlineServerMembers(
       return { user_id: row.user_id, role };
     })
     .filter((row): row is { user_id: string; role: MemberRoleInfo } => row !== null);
+
+  return { roleById, everyoneRole, assignments };
+}
+
+export async function getOnlineServerMembers(
+  db: D1Database,
+  serverId: string,
+  ownerId: string,
+): Promise<RankedOnlineMember[]> {
+  const membersResult = await db
+    .prepare(
+      `SELECT sm.user_id, u.username, u.display_name, u.avatar_url,
+              CASE WHEN s.owner_id = sm.user_id THEN 1 ELSE 0 END AS is_owner
+       FROM server_members sm
+       INNER JOIN users u ON u.id = sm.user_id
+       INNER JOIN servers s ON s.id = sm.server_id
+       INNER JOIN server_presence sp
+         ON sp.server_id = sm.server_id
+        AND sp.user_id = sm.user_id
+       WHERE sm.server_id = ?
+         AND sp.last_seen_at >= datetime('now', ?)`,
+    )
+    .bind(serverId, `-${PRESENCE_ONLINE_SECONDS} seconds`)
+    .all<{
+      user_id: string;
+      username: string;
+      display_name: string;
+      avatar_url: string | null;
+      is_owner: number;
+    }>();
+
+  const members = membersResult.results ?? [];
+  if (members.length === 0) {
+    return [];
+  }
+
+  const { assignments, everyoneRole } = await loadServerRoleContext(db, serverId);
 
   return rankOnlineMembers(
     members.map((member) => ({
@@ -149,41 +161,7 @@ export async function getAllRankedServerMembers(
     return [];
   }
 
-  const rolesResult = await db
-    .prepare(
-      `SELECT id, name, color, position, permissions, is_everyone
-       FROM server_roles
-       WHERE server_id = ?`,
-    )
-    .bind(serverId)
-    .all<{
-      id: string;
-      name: string;
-      color: string;
-      position: number;
-      permissions: string;
-      is_everyone: number;
-    }>();
-
-  const roleRows = rolesResult.results ?? [];
-  const roleById = new Map(roleRows.map((row) => [row.id, mapRoleRow(row)]));
-  const everyoneRole =
-    roleRows.map((row) => mapRoleRow(row)).find((role) => role.isEveryone) ?? null;
-
-  const assignmentsResult = await db
-    .prepare(`SELECT user_id, role_id FROM member_roles WHERE server_id = ?`)
-    .bind(serverId)
-    .all<{ user_id: string; role_id: string }>();
-
-  const assignments = (assignmentsResult.results ?? [])
-    .map((row) => {
-      const role = roleById.get(row.role_id);
-      if (!role) {
-        return null;
-      }
-      return { user_id: row.user_id, role };
-    })
-    .filter((row): row is { user_id: string; role: MemberRoleInfo } => row !== null);
+  const { assignments, everyoneRole } = await loadServerRoleContext(db, serverId);
 
   const ranked = rankOnlineMembers(
     members.map((member) => ({
@@ -226,13 +204,10 @@ export async function getVisibleOnlineServerMembers(
   ownerId: string,
 ): Promise<RankedOnlineMember[]> {
   const members = await getOnlineServerMembers(db, serverId, ownerId);
-  const visible: RankedOnlineMember[] = [];
+  const visibility = await getActivityVisibilityMap(
+    db,
+    members.map((member) => member.userId),
+  );
 
-  for (const member of members) {
-    if (await shouldShowActivityStatus(db, member.userId)) {
-      visible.push(member);
-    }
-  }
-
-  return visible;
+  return members.filter((member) => visibility.get(member.userId) !== false);
 }

@@ -1,13 +1,8 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useState, Suspense, lazy, type CSSProperties } from "react";
 import { useNavigate } from "react-router-dom";
 import { FriendsIcon, HashIcon } from "../components/UiIcons";
 import ServerSidebar from "../components/ServerSidebar";
-import FriendsDmPanel from "../components/FriendsDmPanel";
-import ServerSettingsPanel from "../components/ServerSettingsPanel";
 import TextChannelPanel from "../components/TextChannelPanel";
-import VoiceStageView from "../components/VoiceStageView";
-import UserSettingsPanel from "../components/UserSettingsPanel";
-import VoiceSettingsPanel from "../components/VoiceSettingsPanel";
 import type { VoiceSettingsFocus } from "../components/VoiceVideoSettingsTab";
 import RulesAcceptModal from "../components/RulesAcceptModal";
 import MembersPanel from "../components/MembersPanel";
@@ -19,10 +14,16 @@ import { resolveHomePath } from "../lib/navigation";
 import { shouldShowVoiceStage } from "../lib/voice-stage";
 import { getVoiceVideoPreferences } from "../lib/voice-video-settings";
 import { useVoiceShortcuts } from "../hooks/useVoiceShortcuts";
-import ForumChannelPanel from "../components/ForumChannelPanel";
-import GlobalSearchModal from "../components/GlobalSearchModal";
 import PwaInstallPrompt from "../components/PwaInstallPrompt";
-import DmPopout from "../components/DmPopout";
+
+const FriendsDmPanel = lazy(() => import("../components/FriendsDmPanel"));
+const ServerSettingsPanel = lazy(() => import("../components/ServerSettingsPanel"));
+const VoiceStageView = lazy(() => import("../components/VoiceStageView"));
+const UserSettingsPanel = lazy(() => import("../components/UserSettingsPanel"));
+const VoiceSettingsPanel = lazy(() => import("../components/VoiceSettingsPanel"));
+const ForumChannelPanel = lazy(() => import("../components/ForumChannelPanel"));
+const GlobalSearchModal = lazy(() => import("../components/GlobalSearchModal"));
+const DmPopout = lazy(() => import("../components/DmPopout"));
 
 function resolveMessageChannelId(channels: Channel[], preferredId?: string | null): string | null {
   if (preferredId) {
@@ -176,9 +177,6 @@ export default function AppPage() {
           : response.servers[0]?.id ?? null;
 
       setActiveServerId(nextId);
-      if (nextId) {
-        await loadChannels(nextId);
-      }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Could not load servers.");
     } finally {
@@ -225,7 +223,6 @@ export default function AppPage() {
       return [...current, server];
     });
     setActiveServerId(server.id);
-    void loadChannels(server.id);
   }
 
   function handleChannelCreated(channel: Channel) {
@@ -392,14 +389,17 @@ export default function AppPage() {
           {loading && <p>Loading server...</p>}
           {loadError && <div className="settings-error">{loadError}</div>}
           {!loading && showFriends ? (
-            <FriendsDmPanel
-              openDmUserId={openDmUserId}
-              onOpenDmHandled={() => setOpenDmUserId(null)}
-              onJoinVoiceInvite={(serverId, channelId) => void handleJoinVoiceInvite(serverId, channelId)}
-              joiningVoiceInvite={joiningVoiceInvite}
-            />
+            <Suspense fallback={<p>Loading friends...</p>}>
+              <FriendsDmPanel
+                openDmUserId={openDmUserId}
+                onOpenDmHandled={() => setOpenDmUserId(null)}
+                onJoinVoiceInvite={(serverId, channelId) => void handleJoinVoiceInvite(serverId, channelId)}
+                joiningVoiceInvite={joiningVoiceInvite}
+              />
+            </Suspense>
           ) : !loading && inVoiceStage && activeServer && user && voice.joined && voice.joined.serverId === activeServer.id ? (
-            <VoiceStageView
+            <Suspense fallback={<p>Loading voice stage...</p>}>
+              <VoiceStageView
               serverId={activeServer.id}
               serverName={activeServer.name}
               channelId={voice.joined.channelId}
@@ -438,13 +438,16 @@ export default function AppPage() {
                   : null
               }
             />
+            </Suspense>
           ) : !loading && activeForumChannel && user ? (
-            <ForumChannelPanel
+            <Suspense fallback={<p>Loading forum...</p>}>
+              <ForumChannelPanel
               serverId={activeServer!.id}
               channelId={activeForumChannel.id}
               channelName={activeForumChannel.name}
               currentUserId={user.id}
             />
+            </Suspense>
           ) : !loading && activeTextChannel && user ? (
             <TextChannelPanel
               serverId={activeServer!.id}
@@ -495,61 +498,71 @@ export default function AppPage() {
       )}
 
       {userSettingsOpen && (
-        <UserSettingsPanel
-          onClose={() => {
-            setUserSettingsOpen(false);
-          }}
-        />
+        <Suspense fallback={null}>
+          <UserSettingsPanel
+            onClose={() => {
+              setUserSettingsOpen(false);
+            }}
+          />
+        </Suspense>
       )}
 
       {voiceSettingsOpen && (
-        <VoiceSettingsPanel
-          focus={voiceSettingsFocus}
-          onClose={() => {
-            setVoiceSettingsOpen(false);
-            setVoiceSettingsFocus(undefined);
-          }}
-        />
+        <Suspense fallback={null}>
+          <VoiceSettingsPanel
+            focus={voiceSettingsFocus}
+            onClose={() => {
+              setVoiceSettingsOpen(false);
+              setVoiceSettingsFocus(undefined);
+            }}
+          />
+        </Suspense>
       )}
 
-      <DmPopout
-        open={dmPopoutOpen}
-        onClose={() => setDmPopoutOpen(false)}
-        onJoinVoiceInvite={(serverId, channelId) => void handleJoinVoiceInvite(serverId, channelId)}
-        joiningVoiceInvite={joiningVoiceInvite}
-      />
+      <Suspense fallback={null}>
+        <DmPopout
+          open={dmPopoutOpen}
+          onClose={() => setDmPopoutOpen(false)}
+          onJoinVoiceInvite={(serverId, channelId) => void handleJoinVoiceInvite(serverId, channelId)}
+          joiningVoiceInvite={joiningVoiceInvite}
+        />
+      </Suspense>
 
       {voiceSetupOpen && (
         <VoiceSetupModal onComplete={() => setVoiceSetupOpen(false)} />
       )}
 
       {settingsOpen && activeServer && user && (
-        <ServerSettingsPanel
-          serverId={activeServer.id}
-          currentUserId={user.id}
-          onClose={() => setSettingsOpen(false)}
-          onServerUpdated={(server) => {
-            setServers((current) =>
-              current.map((item) => (item.id === server.id ? { ...item, ...server } : item)),
-            );
-          }}
-          onServerLeft={() => {
-            if (voice.joined?.serverId === activeServer.id) {
-              voice.disconnect();
-            }
-            void reloadServers();
-          }}
-        />
+        <Suspense fallback={null}>
+          <ServerSettingsPanel
+            serverId={activeServer.id}
+            currentUserId={user.id}
+            onClose={() => setSettingsOpen(false)}
+            onServerUpdated={(server) => {
+              setServers((current) =>
+                current.map((item) => (item.id === server.id ? { ...item, ...server } : item)),
+              );
+            }}
+            onServerLeft={() => {
+              if (voice.joined?.serverId === activeServer.id) {
+                voice.disconnect();
+              }
+              void reloadServers();
+            }}
+          />
+        </Suspense>
       )}
 
       {activeServer && (
-        <GlobalSearchModal
-          serverId={activeServer.id}
-          open={globalSearchOpen}
-          onClose={() => setGlobalSearchOpen(false)}
-          onSelectMessage={(channelId, _messageId) => setActiveChannelId(channelId)}
-          onSelectForumPost={(channelId) => setActiveChannelId(channelId)}
-        />
+        <Suspense fallback={null}>
+          <GlobalSearchModal
+            serverId={activeServer.id}
+            open={globalSearchOpen}
+            onClose={() => setGlobalSearchOpen(false)}
+            onSelectMessage={(channelId, _messageId) => setActiveChannelId(channelId)}
+            onSelectForumPost={(channelId) => setActiveChannelId(channelId)}
+          />
+        </Suspense>
       )}
 
       <PwaInstallPrompt />
