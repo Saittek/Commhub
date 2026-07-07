@@ -22,6 +22,8 @@ export interface UpdateServerInput {
   defaultNotifications?: string;
   explicitContentFilter?: boolean;
   afkTimeoutMinutes?: number;
+  afkChannelId?: string | null;
+  vanityUrl?: string | null;
   uiTextScale?: number;
   isPublic?: boolean;
 }
@@ -108,6 +110,13 @@ export function validateUpdateServer(input: UpdateServerInput): string | null {
     (!Number.isInteger(input.uiTextScale) || !VALID_UI_TEXT_SCALES.has(input.uiTextScale))
   ) {
     return "Text size must be Compact, Default, Comfortable, or Large.";
+  }
+
+  if (input.vanityUrl !== undefined && input.vanityUrl !== null) {
+    const vanity = input.vanityUrl.trim().toLowerCase();
+    if (vanity && !/^[a-z0-9-]{2,32}$/.test(vanity)) {
+      return "Vanity URL must be 2-32 characters using lowercase letters, numbers, or hyphens.";
+    }
   }
 
   return null;

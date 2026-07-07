@@ -2,8 +2,10 @@ import type { Hono } from "hono";
 import { requireUser } from "./lib/session";
 import { requireServerMember, requireManageServer } from "./lib/server-access";
 import { memberHasPermission } from "./lib/user-permissions";
-import { countUnreadMessages } from "./lib/messages";
-import { listServerChannels, getServerChannel } from "./lib/channels";
+import { countUnreadMessagesForServer } from "./lib/messages";
+import { getServerChannel } from "./lib/channels";
+import { broadcastDmEvent } from "./message-routes";
+import { notifyDmMessage } from "./lib/push-notify";
 import { writeAuditLog } from "./safety-routes";
 import {
   checkAutomod,
@@ -36,14 +38,7 @@ export function registerDiscordRoutes(app: Hono<{ Bindings: Env }>) {
     const server = await requireServerMember(c, user, c.req.param("serverId"));
     if (server instanceof Response) return server;
 
-    const channels = await listServerChannels(c.env.DB, server.id);
-    const unread: Record<string, number> = {};
-
-    for (const channel of channels) {
-      if (channel.type === "text") {
-        unread[channel.id] = await countUnreadMessages(c.env.DB, channel.id, user.sub);
-      }
-    }
+    const unread = await countUnreadMessagesForServer(c.env.DB, server.id, user.sub);
 
     return c.json({ unread });
   });
@@ -587,21 +582,60 @@ export function registerDiscordRoutes(app: Hono<{ Bindings: Env }>) {
 
     const attachments = await loadDmAttachmentsByMessageIds(c.env.DB, [messageId]);
 
-    return c.json({
-      message: {
-        id: messageId,
-        channelId,
-        author: {
-          id: user.sub,
-          username: profile?.username ?? "",
-          displayName: profile?.display_name ?? "",
-        },
-        content,
-        createdAt: new Date().toISOString(),
-        editedAt: null,
-        attachments: attachments.get(messageId) ?? [],
+    const messagePayload = {
+      id: messageId,
+      channelId,
+      author: {
+        id: user.sub,
+        username: profile?.username ?? "",
+        displayName: profile?.display_name ?? "",
       },
-    });
+      content,
+      createdAt: new Date().toISOString(),
+      editedAt: null,
+      attachments: attachments.get(messageId) ?? [],
+    };
+
+    await broadcastDmEvent(c.env, channelId, { type: "message-create", message: messagePayload });
+    void notifyDmMessage(c.env, channelId, user.sub, profile?.display_name ?? "Someone", content);
+
+    return c.json({ message: messagePayload });
+  });
+
+  app.get("/api/dms/:channelId/live", async (c) => {
+    const user = await requireUser(c);
+    if (user instanceof Response) return user;
+
+    const channelId = c.req.param("channelId");
+    const membership = await c.env.DB.prepare(
+      "SELECT 1 FROM dm_participants WHERE channel_id = ? AND user_id = ? LIMIT 1",
+    )
+      .bind(channelId, user.sub)
+      .first();
+
+    if (!membership) {
+      return jsonError("DM channel not found.", 404);
+    }
+
+    if (!c.env.TEXT_ROOM) {
+      return jsonError("Real-time service is unavailable.", 503);
+    }
+
+    const profile = await c.env.DB.prepare(
+      "SELECT username, display_name FROM users WHERE id = ? LIMIT 1",
+    )
+      .bind(user.sub)
+      .first<{ username: string; display_name: string }>();
+
+    const headers = new Headers(c.req.raw.headers);
+    headers.set("X-User-Id", user.sub);
+    headers.set("X-Display-Name", profile?.display_name ?? "User");
+    headers.set("X-Username", profile?.username ?? "user");
+
+    const roomId = c.env.TEXT_ROOM.idFromName(`dm-${channelId}`);
+    const stub = c.env.TEXT_ROOM.get(roomId);
+    const upgradeRequest = new Request(c.req.raw, { headers });
+    return await stub.fetch(upgradeRequest);
   });
 
   app.get("/api/servers/:serverId/search", async (c) => {
@@ -618,18 +652,39 @@ export function registerDiscordRoutes(app: Hono<{ Bindings: Env }>) {
 
     const rows = await c.env.DB.prepare(
       `SELECT m.id, m.channel_id, m.content, m.created_at, c.name AS channel_name,
-              u.username, u.display_name
+              u.username, u.display_name, m.thread_root_id
        FROM messages m
        INNER JOIN channels c ON c.id = m.channel_id
        INNER JOIN users u ON u.id = m.author_id
-       WHERE m.server_id = ? AND m.deleted_at IS NULL AND m.thread_root_id IS NULL
-         AND m.content LIKE ?
-       ORDER BY m.created_at DESC LIMIT 25`,
+       WHERE m.server_id = ? AND m.deleted_at IS NULL AND m.content LIKE ?
+       ORDER BY m.created_at DESC LIMIT 50`,
     )
       .bind(server.id, `%${q}%`)
       .all<{
         id: string;
         channel_id: string;
+        content: string;
+        created_at: string;
+        channel_name: string;
+        username: string;
+        display_name: string;
+        thread_root_id: string | null;
+      }>();
+
+    const forumRows = await c.env.DB.prepare(
+      `SELECT fp.id, fp.channel_id, fp.title, fp.content, fp.created_at, c.name AS channel_name,
+              u.username, u.display_name
+       FROM forum_posts fp
+       INNER JOIN channels c ON c.id = fp.channel_id
+       INNER JOIN users u ON u.id = fp.author_id
+       WHERE fp.server_id = ? AND (fp.title LIKE ? OR fp.content LIKE ?)
+       ORDER BY fp.created_at DESC LIMIT 25`,
+    )
+      .bind(server.id, `%${q}%`, `%${q}%`)
+      .all<{
+        id: string;
+        channel_id: string;
+        title: string;
         content: string;
         created_at: string;
         channel_name: string;
@@ -642,6 +697,16 @@ export function registerDiscordRoutes(app: Hono<{ Bindings: Env }>) {
         messageId: r.id,
         channelId: r.channel_id,
         channelName: r.channel_name,
+        content: r.content,
+        createdAt: r.created_at,
+        threadRootId: r.thread_root_id,
+        author: { username: r.username, displayName: r.display_name },
+      })),
+      forumPosts: (forumRows.results ?? []).map((r) => ({
+        postId: r.id,
+        channelId: r.channel_id,
+        channelName: r.channel_name,
+        title: r.title,
         content: r.content,
         createdAt: r.created_at,
         author: { username: r.username, displayName: r.display_name },

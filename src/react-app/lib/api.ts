@@ -21,6 +21,8 @@ export interface Server {
   defaultNotifications?: string;
   explicitContentFilter?: boolean;
   afkTimeoutMinutes?: number;
+  afkChannelId?: string | null;
+  vanityUrl?: string | null;
   uiTextScale?: number;
   isPublic?: boolean;
 }
@@ -68,6 +70,8 @@ export interface UpdateServerPayload {
   defaultNotifications?: string;
   explicitContentFilter?: boolean;
   afkTimeoutMinutes?: number;
+  afkChannelId?: string | null;
+  vanityUrl?: string | null;
   uiTextScale?: number;
   isPublic?: boolean;
 }
@@ -438,7 +442,7 @@ export function deleteServer(serverId: string): Promise<{ ok: boolean }> {
   });
 }
 
-export type ChannelType = "text" | "voice";
+export type ChannelType = "text" | "voice" | "forum" | "announcement" | "stage";
 
 export interface Channel {
   id: string;
@@ -660,6 +664,7 @@ export interface Message {
   embeds: MessageEmbed[];
   threadArchived: boolean;
   threadLocked: boolean;
+  sticker?: { id: string; name: string; url: string } | null;
 }
 
 export interface MessagesResponse {
@@ -711,6 +716,7 @@ export function sendMessage(
     threadRootId?: string | null;
     replyToId?: string | null;
     attachmentIds?: string[];
+    stickerId?: string | null;
   },
 ): Promise<MessageResponse> {
   return request<MessageResponse>(`/api/servers/${serverId}/channels/${channelId}/messages`, {
@@ -1120,11 +1126,89 @@ export interface SearchResult {
   channelName: string;
   content: string;
   createdAt: string;
+  threadRootId?: string | null;
   author: { username: string; displayName: string };
 }
 
-export function searchMessages(serverId: string, q: string): Promise<{ results: SearchResult[] }> {
+export interface ForumSearchResult {
+  postId: string;
+  channelId: string;
+  channelName: string;
+  title: string;
+  content: string;
+  createdAt: string;
+  author: { username: string; displayName: string };
+}
+
+export function searchMessages(
+  serverId: string,
+  q: string,
+): Promise<{ results: SearchResult[]; forumPosts?: ForumSearchResult[] }> {
   return request(`/api/servers/${serverId}/search?q=${encodeURIComponent(q)}`);
+}
+
+export interface ForumPost {
+  id: string;
+  channelId: string;
+  serverId: string;
+  title: string;
+  content: string;
+  pinned: boolean;
+  locked: boolean;
+  createdAt: string;
+  commentCount: number;
+  author: {
+    id: string;
+    username: string;
+    displayName: string;
+    avatarUrl: string | null;
+  };
+}
+
+export interface ForumComment {
+  id: string;
+  postId: string;
+  content: string;
+  createdAt: string;
+  author: { id: string; username: string; displayName: string };
+}
+
+export function getForumPosts(
+  serverId: string,
+  channelId: string,
+): Promise<{ posts: ForumPost[] }> {
+  return request(`/api/servers/${serverId}/channels/${channelId}/forum/posts`);
+}
+
+export function createForumPost(
+  serverId: string,
+  channelId: string,
+  payload: { title: string; content: string },
+): Promise<{ post: ForumPost }> {
+  return request(`/api/servers/${serverId}/channels/${channelId}/forum/posts`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getForumComments(
+  serverId: string,
+  channelId: string,
+  postId: string,
+): Promise<{ comments: ForumComment[] }> {
+  return request(`/api/servers/${serverId}/channels/${channelId}/forum/posts/${postId}/comments`);
+}
+
+export function createForumComment(
+  serverId: string,
+  channelId: string,
+  postId: string,
+  content: string,
+): Promise<{ comment: ForumComment }> {
+  return request(`/api/servers/${serverId}/channels/${channelId}/forum/posts/${postId}/comments`, {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
 }
 
 export function reportContent(

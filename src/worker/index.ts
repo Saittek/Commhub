@@ -51,6 +51,7 @@ import {
 } from "./lib/server-access";
 import {
   getServerChannel,
+  isVoiceLikeType,
   listServerChannels,
   mapChannel,
   normalizeChannelName,
@@ -97,7 +98,6 @@ import {
   enforceJoinSafety,
   mapOnlineMembersForServer,
   writeAuditLog,
-  checkVerificationLevel,
 } from "./safety-routes";
 import { registerDiscordRoutes } from "./discord-routes";
 import { registerDiscordExtraRoutes } from "./discord-routes-extra";
@@ -105,7 +105,9 @@ import { registerDiscordCompletionRoutes } from "./discord-completion-routes";
 import { registerBotRoutes } from "./bot-routes";
 import { registerOAuthRoutes } from "./oauth-routes";
 import { registerPlatformRoutes } from "./platform-routes";
-import { isMemberTimedOut } from "./lib/discord-features";
+import { registerForumRoutes } from "./forum-routes";
+import { registerCallsRoutes } from "./calls-routes";
+import { requireVoiceChannelAccess } from "./lib/voice-access";
 import { ensurePrivacySettings } from "./lib/privacy";
 import { buildUserProfile } from "./lib/user-profile";
 
@@ -709,12 +711,63 @@ app.post("/api/servers/join", async (c) => {
       return jsonError("Server not found or is not listed publicly.", 404);
     }
   } else {
+    const code = input.inviteCode ?? "";
     server = await c.env.DB.prepare(
       `SELECT id, name, invite_code, owner_id, invites_paused
        FROM servers WHERE invite_code = ? COLLATE NOCASE LIMIT 1`,
     )
-      .bind(input.inviteCode)
+      .bind(code)
       .first();
+
+    if (!server) {
+      server = await c.env.DB.prepare(
+        `SELECT id, name, invite_code, owner_id, invites_paused
+         FROM servers WHERE vanity_url = ? COLLATE NOCASE LIMIT 1`,
+      )
+        .bind(code.toLowerCase())
+        .first();
+    }
+
+    if (!server) {
+      const customInvite = await c.env.DB.prepare(
+        `SELECT si.server_id, si.max_uses, si.uses, si.expires_at,
+                s.id, s.name, s.invite_code, s.owner_id, s.invites_paused
+         FROM server_invites si
+         INNER JOIN servers s ON s.id = si.server_id
+         WHERE si.code = ? COLLATE NOCASE LIMIT 1`,
+      )
+        .bind(code)
+        .first<{
+          server_id: string;
+          max_uses: number | null;
+          uses: number;
+          expires_at: string | null;
+          id: string;
+          name: string;
+          invite_code: string;
+          owner_id: string;
+          invites_paused: number;
+        }>();
+
+      if (customInvite) {
+        if (customInvite.expires_at && new Date(customInvite.expires_at) < new Date()) {
+          return jsonError("This invite has expired.", 410);
+        }
+        if (customInvite.max_uses !== null && customInvite.uses >= customInvite.max_uses) {
+          return jsonError("This invite has reached its maximum uses.", 410);
+        }
+        server = {
+          id: customInvite.id,
+          name: customInvite.name,
+          invite_code: customInvite.invite_code,
+          owner_id: customInvite.owner_id,
+          invites_paused: customInvite.invites_paused,
+        };
+        await c.env.DB.prepare("UPDATE server_invites SET uses = uses + 1 WHERE server_id = ? AND code = ? COLLATE NOCASE")
+          .bind(customInvite.server_id, code)
+          .run();
+      }
+    }
   }
 
   if (!server) {
@@ -846,6 +899,31 @@ app.patch("/api/servers/:serverId", async (c) => {
   if (body.afkTimeoutMinutes !== undefined) {
     updates.push("afk_timeout_minutes = ?");
     values.push(body.afkTimeoutMinutes);
+  }
+  if (body.afkChannelId !== undefined) {
+    if (body.afkChannelId) {
+      const afkChannel = await getServerChannel(c.env.DB, server.id, body.afkChannelId);
+      if (!afkChannel || !isVoiceLikeType(afkChannel.type)) {
+        return jsonError("AFK channel must be a voice or stage channel.", 400);
+      }
+    }
+    updates.push("afk_channel_id = ?");
+    values.push(body.afkChannelId ?? "");
+  }
+  if (body.vanityUrl !== undefined) {
+    const vanity = body.vanityUrl?.trim().toLowerCase() || null;
+    if (vanity) {
+      const taken = await c.env.DB.prepare(
+        "SELECT id FROM servers WHERE vanity_url = ? COLLATE NOCASE AND id != ? LIMIT 1",
+      )
+        .bind(vanity, server.id)
+        .first();
+      if (taken) {
+        return jsonError("That vanity URL is already taken.", 409);
+      }
+    }
+    updates.push("vanity_url = ?");
+    values.push(vanity ?? "");
   }
   if (body.uiTextScale !== undefined) {
     updates.push("ui_text_scale = ?");
@@ -1361,53 +1439,21 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
     return user;
   }
 
-  const server = await requireServerMember(c, user, c.req.param("serverId"));
-  if (server instanceof Response) {
-    return server;
-  }
-
   if (!c.env.VOICE_ROOM) {
     return jsonError("Voice service is unavailable. Restart the dev server.", 503);
   }
 
-  const channelId = c.req.param("channelId");
-  const channel = await getServerChannel(c.env.DB, server.id, channelId);
-
-  if (!channel) {
-    return jsonError("Channel not found.", 404);
-  }
-
-  if (channel.type !== "voice") {
-    return jsonError("This channel is not a voice channel.", 400);
-  }
-
-  const verificationError = await checkVerificationLevel(c.env.DB, server, user.sub);
-  if (verificationError) {
-    return jsonError(verificationError, 403);
-  }
-
-  const canConnect = await memberHasPermission(
-    c.env.DB,
-    server.id,
-    user.sub,
-    server.owner_id,
-    "connect_voice",
+  const access = await requireVoiceChannelAccess(
+    c,
+    user,
+    c.req.param("serverId"),
+    c.req.param("channelId"),
   );
-  if (!canConnect) {
-    return jsonError("You do not have permission to join voice channels.", 403);
+  if (access instanceof Response) {
+    return access;
   }
 
-  if (await isMemberTimedOut(c.env.DB, server.id, user.sub)) {
-    return jsonError("You are timed out and cannot join voice channels.", 403);
-  }
-
-  const canSpeak = await memberHasPermission(
-    c.env.DB,
-    server.id,
-    user.sub,
-    server.owner_id,
-    "speak_voice",
-  );
+  const { server, channel, canSpeak } = access;
 
   const profile = await c.env.DB.prepare(
     "SELECT username, display_name FROM users WHERE id = ? LIMIT 1",
@@ -1440,8 +1486,14 @@ app.get("/api/servers/:serverId/channels/:channelId/voice", async (c) => {
     headers.set("X-Username", profile.username);
     headers.set("X-Voice-User-Limit", String(resolveVoiceUserLimit(channel.voice_user_limit)));
     headers.set("X-Can-Speak", canSpeak ? "1" : "0");
+    headers.set("X-Server-Id", server.id);
 
-    const roomId = c.env.VOICE_ROOM.idFromName(channelId);
+    const callsSessionId = new URL(c.req.url).searchParams.get("callsSessionId");
+    if (callsSessionId?.trim()) {
+      headers.set("X-Calls-Session-Id", callsSessionId.trim());
+    }
+
+    const roomId = c.env.VOICE_ROOM.idFromName(channel.id);
     const stub = c.env.VOICE_ROOM.get(roomId);
     const upgradeRequest = new Request(c.req.raw, { headers });
     return await stub.fetch(upgradeRequest);
@@ -1942,5 +1994,7 @@ registerDiscordCompletionRoutes(app);
 registerBotRoutes(app);
 registerOAuthRoutes(app);
 registerPlatformRoutes(app);
+registerForumRoutes(app);
+registerCallsRoutes(app);
 
 export default app;

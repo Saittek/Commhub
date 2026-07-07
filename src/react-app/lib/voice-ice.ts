@@ -1,5 +1,9 @@
 export function buildIceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  const servers: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+  ];
 
   const turnUrl = import.meta.env.VITE_TURN_URL as string | undefined;
   if (!turnUrl?.trim()) {
@@ -19,4 +23,12 @@ export function buildIceServers(): RTCIceServer[] {
 
   servers.push(entry);
   return servers;
+}
+
+export function buildIceServersForCalls(configServers?: RTCIceServer[]): RTCIceServer[] {
+  if (configServers?.length) {
+    return configServers;
+  }
+
+  return [{ urls: "stun:stun.cloudflare.com:3478" }];
 }

@@ -8102,3 +8102,6 @@ textarea:focus {
   }
 }
 
+
+/* Forum + platform polish */
+.forum-channel-panel { padding: 16px 20px; overflow-y: auto; height: 100%; }

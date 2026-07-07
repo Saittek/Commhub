@@ -14,7 +14,23 @@ export function resolveVoiceUserLimit(channelLimit: number): number {
   return Math.min(channelLimit, MAX_VOICE_CHANNEL_USERS);
 }
 
-export type ChannelType = "text" | "voice";
+export type ChannelType = "text" | "voice" | "forum" | "announcement" | "stage";
+
+const CHANNEL_TYPES = new Set<ChannelType>([
+  "text",
+  "voice",
+  "forum",
+  "announcement",
+  "stage",
+]);
+
+export function isVoiceLikeType(type: string): boolean {
+  return type === "voice" || type === "stage";
+}
+
+export function isMessageChannelType(type: string): boolean {
+  return type === "text" || type === "announcement";
+}
 
 export interface CreateChannelInput {
   name: string;
@@ -90,7 +106,7 @@ export async function listServerChannels(db: D1Database, serverId: string): Prom
       )
       .bind(serverId)
       .all<ChannelRow>();
-    return (result.results ?? []).filter((row) => row.type === "text" || row.type === "voice");
+    return (result.results ?? []).filter((row) => CHANNEL_TYPES.has(row.type as ChannelType));
   } catch {
     try {
       const result = await db
@@ -103,7 +119,7 @@ export async function listServerChannels(db: D1Database, serverId: string): Prom
         .all<Omit<ChannelRow, "category_id" | "position">>();
       return (result.results ?? [])
         .map((row) => withDefaultVoiceFields({ ...row, category_id: null, position: 0 }))
-        .filter((row) => row.type === "text" || row.type === "voice");
+        .filter((row) => CHANNEL_TYPES.has(row.type as ChannelType));
     } catch {
       const result = await db
         .prepare(
@@ -115,7 +131,7 @@ export async function listServerChannels(db: D1Database, serverId: string): Prom
         .all<Omit<ChannelRow, "voice_bitrate" | "voice_user_limit" | "voice_ptt_only">>();
       return (result.results ?? [])
         .map(withDefaultVoiceFields)
-        .filter((row) => row.type === "text" || row.type === "voice");
+        .filter((row) => CHANNEL_TYPES.has(row.type as ChannelType));
     }
   }
 }
@@ -157,8 +173,8 @@ export function validateCreateChannel(input: CreateChannelInput): string | null 
     return "Channel name must be 2-32 characters using letters, numbers, hyphens, or underscores.";
   }
 
-  if (input.type !== "text" && input.type !== "voice") {
-    return "Channel type must be text or voice.";
+  if (!CHANNEL_TYPES.has(input.type)) {
+    return "Channel type must be text, voice, forum, announcement, or stage.";
   }
 
   return null;

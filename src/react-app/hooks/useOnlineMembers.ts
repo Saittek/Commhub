@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { getOnlineMembers, type OnlineMember } from "../lib/api";
+import { getOnlineMembers, heartbeatServerPresence, type OnlineMember } from "../lib/api";
 
 const REFRESH_MS = 15_000;
 
@@ -18,6 +18,7 @@ export function useOnlineMembers(serverId: string | null) {
 
     try {
       setError(null);
+      void heartbeatServerPresence(serverId);
       const response = await getOnlineMembers(serverId);
       setMembers(response.members);
       setOnlineCount(response.onlineCount);

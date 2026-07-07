@@ -7,6 +7,7 @@ import {
   getMyPermissions,
   getPinnedMessages,
   getServerEmojis,
+  getServerStickers,
   getServerMembers,
   getThreadCounts,
   markChannelRead,
@@ -23,6 +24,7 @@ import {
   type RolePermissions,
   type SearchResult,
   type ServerEmoji,
+  type ServerSticker,
   type ServerMember,
 } from "../lib/api";
 import {
@@ -103,6 +105,8 @@ export default function TextChannelPanel({
   const [threadCounts, setThreadCounts] = useState<Record<string, number>>({});
   const [showJumpToPresent, setShowJumpToPresent] = useState(false);
   const [serverEmojis, setServerEmojis] = useState<ServerEmoji[]>([]);
+  const [serverStickers, setServerStickers] = useState<ServerSticker[]>([]);
+  const [stickerPickerOpen, setStickerPickerOpen] = useState(false);
   const [threadLocked, setThreadLocked] = useState(false);
   const [profileAnchor, setProfileAnchor] = useState<{
     userId: string;
@@ -337,7 +341,28 @@ export default function TextChannelPanel({
     void getServerEmojis(serverId)
       .then((response) => setServerEmojis(response.emojis))
       .catch(() => setServerEmojis([]));
+    void getServerStickers(serverId)
+      .then((response) => setServerStickers(response.stickers))
+      .catch(() => setServerStickers([]));
   }, [serverId]);
+
+  async function handleSendSticker(stickerId: string) {
+    setSending(true);
+    setError(null);
+    try {
+      const response = await sendMessage(serverId, channelId, {
+        content: "",
+        threadRootId: activeThreadId,
+        stickerId,
+      });
+      upsertMessage(response.message);
+      setStickerPickerOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not send sticker.");
+    } finally {
+      setSending(false);
+    }
+  }
 
   useEffect(() => {
     setThreadLocked(false);
@@ -975,6 +1000,32 @@ export default function TextChannelPanel({
                   onSelect={insertEmoji}
                   disabled={sending}
                 />
+                {serverStickers.length > 0 && (
+                  <div className="sticker-picker-wrap">
+                    <button
+                      type="button"
+                      className="emoji-picker-trigger"
+                      title="Send sticker"
+                      onClick={() => setStickerPickerOpen((open) => !open)}
+                    >
+                      ST
+                    </button>
+                    {stickerPickerOpen && (
+                      <div className="sticker-picker-menu">
+                        {serverStickers.map((sticker) => (
+                          <button
+                            key={sticker.id}
+                            type="button"
+                            className="sticker-picker-item"
+                            onClick={() => void handleSendSticker(sticker.id)}
+                          >
+                            <img src={sticker.url} alt={sticker.name} />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <textarea
                   ref={composerRef}
                   value={draft}
